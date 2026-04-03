@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# cast-hooks — 13 Claude Code hook scripts for observability, safety, and dispatch
+#
+# Usage: cast-hooks <subcommand> [args]
+#
+# Subcommands: install, list, status, --version
+
+set -uo pipefail
+
+# ── Script directory (resolve symlinks) ──────────────────────────────────────
+CH_BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+CH_REPO_DIR="$(cd "$CH_BIN_DIR/.." && pwd)"
+
+# ── Hooks directory — replaced by Homebrew formula at install time ───────────
+CAST_HOOKS_DIR=""
+
+# ── Version ──────────────────────────────────────────────────────────────────
+if [ -n "${CAST_HOOKS_DIR:-}" ]; then
+  CH_VERSION="$(cat "${CAST_HOOKS_DIR}/VERSION" 2>/dev/null || echo "unknown")"
+else
+  CH_VERSION="$(cat "${CH_REPO_DIR}/VERSION" 2>/dev/null || echo "unknown")"
+fi
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
+  C_BOLD='\033[1m'
+  C_GREEN='\033[0;32m'
+  C_YELLOW='\033[0;33m'
+  C_CYAN='\033[0;36m'
+  C_RED='\033[0;31m'
+  C_DIM='\033[2m'
+  C_RESET='\033[0m'
+else
+  C_BOLD='' C_GREEN='' C_YELLOW='' C_CYAN='' C_RED='' C_DIM='' C_RESET=''
+fi
+
+_info()    { printf "${C_CYAN}%s${C_RESET}\n" "$*"; }
+_success() { printf "${C_GREEN}%s${C_RESET}\n" "$*"; }
+_warn()    { printf "${C_YELLOW}%s${C_RESET}\n" "$*" >&2; }
+_error()   { printf "${C_RED}Error: %s${C_RESET}\n" "$*" >&2; }
+_bold()    { printf "${C_BOLD}%s${C_RESET}\n" "$*"; }
+_dim()     { printf "${C_DIM}%s${C_RESET}\n" "$*"; }
+
+# ── Resolve scripts source dir ────────────────────────────────────────────────
+_scripts_src_dir() {
+  if [ -n "${CAST_HOOKS_DIR:-}" ]; then
+    echo "$CAST_HOOKS_DIR"
+  else
+    echo "${CH_REPO_DIR}/scripts"
+  fi
+}
+
+# ── Resolve config dir ────────────────────────────────────────────────────────
+_config_dir() {
+  if [ -n "${CAST_HOOKS_DIR:-}" ]; then
+    echo "${CAST_HOOKS_DIR}/config"
+  else
+    echo "${CH_REPO_DIR}/config"
+  fi
+}
+
+# ── Subcommand: list ──────────────────────────────────────────────────────────
+_cmd_list() {
+  local config_dir
+  config_dir="$(_config_dir)"
+  local settings_file="${config_dir}/settings.json"
+
+  if [ ! -f "$settings_file" ]; then
+    _error "Settings file not found: $settings_file"
+    exit 1
+  fi
+
+  printf "\n"
+  _bold "cast-hooks v${CH_VERSION} — Hook Registry"
+  printf "${C_DIM}%s${C_RESET}\n" "════════════════════════════════════════════════════════════════════════════"
+  printf "${C_BOLD}  %-24s %-22s %-38s %-8s %-6s${C_RESET}\n" "Hook ID" "Event" "Script" "Timeout" "Async"
+  printf "${C_DIM}%s${C_RESET}\n" "  ──────────────────────────────────────────────────────────────────────────"
+
+  python3 -c "
+import json
+with open('$settings_file') as f:
+    data = json.load(f)
+for event, entries in data.get('hooks', {}).items():
+    for entry in entries:
+        hook_id = entry.get('id', 'unknown')
+        for hook in entry.get('hooks', []):
+            if hook.get('type') != 'command':
+                continue
+            cmd = hook.get('command', '')
+            script = cmd.split('/')[-1] if '/' in cmd else cmd
+            timeout = str(hook.get('timeout', '-'))
+            async_val = 'yes' if hook.get('async', False) else 'no'
+            print(f'  {hook_id:<24s} {event:<22s} {script:<38s} {timeout:<8s} {async_val:<6s}')
+"
+
+  printf "\n"
+  printf "${C_DIM}%d hooks across %d lifecycle events${C_RESET}\n" \
+    "$(python3 -c "import json; d=json.load(open('$settings_file')); print(sum(len(e) for e in d.get('hooks',{}).values()))")" \
+    "$(python3 -c "import json; d=json.load(open('$settings_file')); print(len(d.get('hooks',{})))")"
+  printf "\n"
+}
+
+# ── Subcommand: status ────────────────────────────────────────────────────────
+_cmd_status() {
+  local user_settings="${HOME}/.claude/settings.json"
+  local config_dir
+  config_dir="$(_config_dir)"
+  local hook_settings="${config_dir}/settings.json"
+
+  if [ ! -f "$hook_settings" ]; then
+    _error "Hook settings not found: $hook_settings"
+    exit 1
+  fi
+
+  printf "\n"
+  _bold "cast-hooks v${CH_VERSION} — Active Status"
+  printf "${C_DIM}%s${C_RESET}\n" "══════════════════════════════════════════════════════════"
+
+  if [ ! -f "$user_settings" ]; then
+    _warn "No settings.json found at ${user_settings}"
+    _warn "Run 'cast-hooks install' to set up hooks."
+    printf "\n"
+    return
+  fi
+
+  printf "${C_BOLD}  %-24s %-22s %s${C_RESET}\n" "Hook ID" "Event" "Status"
+  printf "${C_DIM}%s${C_RESET}\n" "  ────────────────────────────────────────────────────"
+
+  python3 -c "
+import json
+
+with open('$hook_settings') as f:
+    expected = json.load(f)
+
+with open('$user_settings') as f:
+    actual = json.load(f)
+
+actual_ids = set()
+for event, entries in actual.get('hooks', {}).items():
+    for entry in entries:
+        if isinstance(entry, dict) and 'id' in entry:
+            actual_ids.add(entry['id'])
+
+active = 0
+inactive = 0
+for event, entries in expected.get('hooks', {}).items():
+    for entry in entries:
+        hook_id = entry.get('id', '')
+        if hook_id in actual_ids:
+            print(f'  {hook_id:<24s} {event:<22s} \033[0;32mactive\033[0m')
+            active += 1
+        else:
+            print(f'  {hook_id:<24s} {event:<22s} \033[0;31minactive\033[0m')
+            inactive += 1
+
+print()
+print(f'  {active} active, {inactive} inactive')
+"
+
+  printf "\n"
+}
+
+# ── Subcommand: install ───────────────────────────────────────────────────────
+_cmd_install() {
+  local src_dir
+  src_dir="$(_scripts_src_dir)"
+  local dst_dir="${HOME}/.claude/scripts"
+
+  if [ ! -d "$src_dir" ]; then
+    _error "Scripts source directory not found: $src_dir"
+    exit 1
+  fi
+
+  printf "\n"
+  _bold "Installing cast-hooks v${CH_VERSION}..."
+  printf "\n"
+
+  # Copy scripts
+  mkdir -p "$dst_dir"
+  local copied=0
+  for f in "$src_dir"/*.sh "$src_dir"/*.py; do
+    [ -f "$f" ] || continue
+    local base
+    base="$(basename "$f")"
+    cp "$f" "${dst_dir}/${base}"
+    chmod +x "${dst_dir}/${base}"
+    _success "  ${base} → ~/.claude/scripts/"
+    copied=$((copied + 1))
+  done
+
+  # Initialize DB schema
+  if [ -f "${dst_dir}/cast-db-init.sh" ]; then
+    bash "${dst_dir}/cast-db-init.sh" 2>/dev/null && _success "  cast.db schema initialized" || _warn "  cast-db-init.sh had warnings (non-fatal)"
+  fi
+
+  # Merge settings
+  printf "\n"
+  local merge_script="${src_dir}/cast-merge-settings.sh"
+  if [ -f "$merge_script" ]; then
+    bash "$merge_script" --yes
+  else
+    _warn "cast-merge-settings.sh not found — run manually"
+  fi
+
+  printf "\n${C_BOLD}══════════════════════════════════════${C_RESET}\n"
+  printf "${C_GREEN}cast-hooks v${CH_VERSION} installed.${C_RESET}\n\n"
+  printf "  Scripts: ${dst_dir} (${copied} files)\n"
+  printf "\n${C_BOLD}Next steps:${C_RESET}\n"
+  printf "  1. Start Claude Code — hooks are now active\n"
+  printf "  2. Run: cast-hooks status\n"
+  printf "  3. Run: cast-hooks list\n\n"
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+_usage() {
+  cat <<USAGE
+${C_BOLD}cast-hooks v${CH_VERSION}${C_RESET} — 13 Claude Code hook scripts
+
+Usage: cast-hooks <subcommand>
+
+Subcommands:
+  ${C_BOLD}install${C_RESET}               Copy hooks to ~/.claude/scripts/, merge settings.json
+  ${C_BOLD}list${C_RESET}                  Show all hooks with event, script, timeout, async
+  ${C_BOLD}status${C_RESET}                Check which hooks are active in ~/.claude/settings.json
+
+Global flags:
+  --version, -v    Print version
+  --help, -h       Show this help
+USAGE
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────────────────
+case "${1:-}" in
+  install)
+    _cmd_install
+    ;;
+  list)
+    _cmd_list
+    ;;
+  status)
+    _cmd_status
+    ;;
+  --version|-v)
+    echo "cast-hooks v${CH_VERSION}"
+    ;;
+  --help|-h|help|"")
+    _usage
+    ;;
+  *)
+    _error "Unknown subcommand: ${1}"
+    printf "Run 'cast-hooks --help' for usage.\n" >&2
+    exit 1
+    ;;
+esac
