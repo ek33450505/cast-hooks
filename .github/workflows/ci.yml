@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh bin/cast-hooks
+
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install bats
+        run: |
+          git clone https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+      - name: Set up runtime dirs
+        run: |
+          mkdir -p ~/.claude/scripts ~/.claude/logs ~/.claude/cast/events ~/.claude/agent-status
+          cp scripts/*.sh ~/.claude/scripts/ 2>/dev/null || true
+          cp scripts/*.py ~/.claude/scripts/ 2>/dev/null || true
+          chmod +x ~/.claude/scripts/*.sh 2>/dev/null || true
+      - name: Run BATS tests
+        run: bats tests/*.bats --tap
