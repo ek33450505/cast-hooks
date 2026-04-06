@@ -18,9 +18,9 @@ else
   C_BOLD='' C_GREEN='' C_YELLOW='' C_RED='' C_RESET=''
 fi
 
-_ok()   { printf "${C_GREEN}  [ok]${C_RESET} %s\n" "$*"; }
-_warn() { printf "${C_YELLOW}  [warn]${C_RESET} %s\n" "$*" >&2; }
-_fail() { printf "${C_RED}  [fail]${C_RESET} %s\n" "$*" >&2; exit 1; }
+_ok()   { printf '%s  [ok]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+_warn() { printf '%s  [warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+_fail() { printf '%s  [fail]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 # ── Validate source ──────────────────────────────────────────────────────────
 if [ ! -f "$HOOKS_SETTINGS" ]; then
@@ -38,7 +38,7 @@ fi
 
 # ── Confirmation ──────────────────────────────────────────────────────────────
 if [ "${1:-}" != "--yes" ] && [ "${CI:-}" != "true" ]; then
-  printf "\n${C_BOLD}Merge cast-hooks into ${USER_SETTINGS}?${C_RESET}\n"
+  printf '\n%sMerge cast-hooks into %s?%s\n' "$C_BOLD" "$USER_SETTINGS" "$C_RESET"
   printf "  This will add/update hook entries. Existing non-hook settings are preserved.\n"
   printf "  A backup will be created first.\n\n"
   printf "  Proceed? [Y/n] "
@@ -93,10 +93,11 @@ with open("$USER_SETTINGS", "w") as f:
 
 print(f"  Added {added} hook(s), updated {updated} hook(s)")
 PYEOF
+MERGE_EXIT=$?
 
-if [ $? -eq 0 ]; then
+if [ "$MERGE_EXIT" -eq 0 ]; then
   _ok "Settings merged successfully"
 else
-  _fail "Merge failed — restoring backup"
   cp "$BACKUP" "$USER_SETTINGS"
+  _fail "Merge failed — backup restored"
 fi

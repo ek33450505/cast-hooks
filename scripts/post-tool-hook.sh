@@ -175,11 +175,12 @@ fi
 # --- Part 4: PostToolUse(Bash non-zero exit) → [CAST-DEBUG] directive ---
 # Only fires in main session (not in subagents) to avoid infinite loops
 if [[ "$TOOL_NAME" == "Bash" && "${CLAUDE_SUBPROCESS:-0}" != "1" ]]; then
-  echo "$INPUT" | python3 - <<'PYEOF' || true
-import sys, json, re
+  export CAST_POST_TOOL_INPUT="$INPUT"
+  python3 - <<'PYEOF' || true
+import sys, json, re, os
 
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(os.environ.get('CAST_POST_TOOL_INPUT', '{}'))
     tool_input = data.get('tool_input', {})
     tool_response = data.get('tool_response', {})
     command = tool_input.get('command', '')

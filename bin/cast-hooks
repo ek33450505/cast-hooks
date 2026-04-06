@@ -190,7 +190,7 @@ _cmd_install() {
 
   # Initialize DB schema
   if [ -f "${dst_dir}/cast-db-init.sh" ]; then
-    bash "${dst_dir}/cast-db-init.sh" 2>/dev/null && _success "  cast.db schema initialized" || _warn "  cast-db-init.sh had warnings (non-fatal)"
+    if bash "${dst_dir}/cast-db-init.sh" 2>/dev/null; then _success "  cast.db schema initialized"; else _warn "  cast-db-init.sh had warnings (non-fatal)"; fi
   fi
 
   # Merge settings
@@ -202,10 +202,10 @@ _cmd_install() {
     _warn "cast-merge-settings.sh not found — run manually"
   fi
 
-  printf "\n${C_BOLD}══════════════════════════════════════${C_RESET}\n"
-  printf "${C_GREEN}cast-hooks v${CH_VERSION} installed.${C_RESET}\n\n"
-  printf "  Scripts: ${dst_dir} (${copied} files)\n"
-  printf "\n${C_BOLD}Next steps:${C_RESET}\n"
+  printf '\n%s══════════════════════════════════════%s\n' "$C_BOLD" "$C_RESET"
+  printf '%scast-hooks v%s installed.%s\n\n' "$C_GREEN" "$CH_VERSION" "$C_RESET"
+  printf '  Scripts: %s (%s files)\n' "$dst_dir" "$copied"
+  printf '\n%sNext steps:%s\n' "$C_BOLD" "$C_RESET"
   printf "  1. Start Claude Code — hooks are now active\n"
   printf "  2. Run: cast-hooks status\n"
   printf "  3. Run: cast-hooks list\n\n"

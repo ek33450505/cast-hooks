@@ -263,6 +263,7 @@ except Exception:
 
         # Store redaction map
         mkdir -p "$HOME/.claude/logs/redact-maps" 2>/dev/null
+        # shellcheck disable=SC2034
         REDACT_MAP_FILE="$HOME/.claude/logs/redact-maps/${CAST_AUDIT_SESSION}-${CAST_AUDIT_TIMESTAMP}.json"
         export CAST_REDACT_RESULT="$REDACT_RESULT"
         export CAST_REDACT_MAP_SESSION="$CAST_AUDIT_SESSION"

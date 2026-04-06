@@ -252,7 +252,7 @@ PYEOF
   )"
   if [ -n "$SUCCESSORS" ]; then
     while IFS= read -r successor; do
-      [ -n "$successor" ] && bash "$QUEUE_ADD" "$successor" "$SESSION_ID" 2>/dev/null || true
+      if [ -n "$successor" ]; then bash "$QUEUE_ADD" "$successor" "$SESSION_ID" 2>/dev/null || true; fi
     done <<< "$SUCCESSORS"
   fi
 fi
