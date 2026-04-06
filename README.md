@@ -1,5 +1,6 @@
 # cast-hooks
 
+[![CI](https://github.com/ek33450505/cast-hooks/actions/workflows/ci.yml/badge.svg)](https://github.com/ek33450505/cast-hooks/actions/workflows/ci.yml)
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
@@ -141,14 +142,17 @@ Timeout tuning: increase `timeout` values if hooks time out on slow machines. Th
 
 ## CAST Ecosystem
 
-cast-hooks is part of [CAST](https://github.com/ek33450505/claude-agent-team) (Claude Agent Specialist Team) — a multi-agent framework for Claude Code with orchestration, hooks, observability, and automated plan execution. Each component works standalone or together:
+Each CAST component ships as a standalone Homebrew package. Mix and match to build your own stack.
 
-- [claude-agent-team](https://github.com/ek33450505/claude-agent-team) — full CAST framework
-- [cast-agents](https://github.com/ek33450505/cast-agents) — 17 specialist agent definitions
-- [cast-dash](https://github.com/ek33450505/cast-dash) — terminal UI dashboard
-- [cast-observe](https://github.com/ek33450505/cast-observe) — observability hooks
-- [cast-security](https://github.com/ek33450505/cast-security) — security guards
-- [homebrew-cast](https://github.com/ek33450505/homebrew-cast) — Homebrew tap for full CAST
+| Package | What It Does | Install |
+|---------|-------------|---------|
+| [cast-agents](https://github.com/ek33450505/cast-agents) | 17 specialist Claude Code agents | `brew tap ek33450505/cast-agents && brew install cast-agents` |
+| **cast-hooks** | 13 hook scripts — observability, safety gates, dispatch | `brew tap ek33450505/cast-hooks && brew install cast-hooks` |
+| [cast-observe](https://github.com/ek33450505/cast-observe) | Session cost + token spend tracking | `brew tap ek33450505/cast-observe && brew install cast-observe` |
+| [cast-security](https://github.com/ek33450505/cast-security) | Policy gates, PII redaction, audit trail | `brew tap ek33450505/cast-security && brew install cast-security` |
+| [cast-dash](https://github.com/ek33450505/cast-dash) | Terminal UI dashboard (Python + Textual) | `brew tap ek33450505/cast-dash && brew install cast-dash` |
+| [cast-memory](https://github.com/ek33450505/cast-memory) | Persistent memory for Claude Code agents | `brew tap ek33450505/cast-memory && brew install cast-memory` |
+| [cast-parallel](https://github.com/ek33450505/cast-parallel) | Parallel plan execution across dual worktrees | `brew tap ek33450505/cast-parallel && brew install cast-parallel` |
 
 ## License
 
