@@ -12,7 +12,7 @@
 
 Hook scripts are shell commands that Claude Code executes at specific lifecycle events — session start, tool use, agent dispatch, compaction, session end. They run automatically in the background, logging everything to `cast.db` (SQLite) and injecting directives like `[CAST-CHAIN]` and `[CAST-REVIEW]` into the conversation when conditions are met.
 
-cast-hooks gives you the hook layer without requiring the full CAST framework, its 17 agents, or its orchestrator. Install the hooks, merge the settings, and Claude Code starts producing structured observability data immediately.
+cast-hooks gives you the hook layer without requiring the full CAST framework, its 30 agents, or its orchestrator. Install the hooks, merge the settings, and Claude Code starts producing structured observability data immediately.
 
 ## Install
 
@@ -146,7 +146,7 @@ Each CAST component ships as a standalone Homebrew package. Mix and match to bui
 
 | Package | What It Does | Install |
 |---------|-------------|---------|
-| [cast-agents](https://github.com/ek33450505/cast-agents) | 17 specialist Claude Code agents | `brew tap ek33450505/cast-agents && brew install cast-agents` |
+| [cast-agents](https://github.com/ek33450505/cast-agents) | 30 specialist Claude Code agents | `brew tap ek33450505/cast-agents && brew install cast-agents` |
 | **cast-hooks** | 13 hook scripts — observability, safety gates, dispatch | `brew tap ek33450505/cast-hooks && brew install cast-hooks` |
 | [cast-observe](https://github.com/ek33450505/cast-observe) | Session cost + token spend tracking | `brew tap ek33450505/cast-observe && brew install cast-observe` |
 | [cast-security](https://github.com/ek33450505/cast-security) | Policy gates, PII redaction, audit trail | `brew tap ek33450505/cast-security && brew install cast-security` |
