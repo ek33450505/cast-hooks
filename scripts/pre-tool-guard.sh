@@ -119,13 +119,14 @@ for policy in config.get('policies', []):
                 pass
             sys.exit(0)
         else:
+            import json as _json
             msg = (
-                f'**[CAST-POLICY-BLOCK]** Policy \"{policy_id}\" blocks this edit.\\n'
-                f'Reason: {description}\\n'
-                f'Required: Dispatch the \`{required_agent}\` agent before editing \`{file_path}\`.\\n'
+                f'[CAST-POLICY-BLOCK] Policy "{policy_id}" blocks this edit. '
+                f'Reason: {description} '
+                f'Required: Dispatch the `{required_agent}` agent before editing `{file_path}`. '
                 f'Escape hatch: Set CAST_POLICY_OVERRIDE=1 to bypass (document your reason).'
             )
-            print(msg)
+            print(_json.dumps({"decision": "block", "reason": msg}))
             sys.exit(2)
     else:
         # severity == warn
@@ -153,7 +154,8 @@ if echo "$FIRST_LINE" | grep -qE "^(cd[[:space:]]+[^[:space:]]+[[:space:]]+&&[[:
 fi
 # Block any other git commit invocation
 if echo "$FIRST_LINE" | grep -qE "(^|[[:space:]])git[[:space:]]+commit"; then
-  echo "**[CAST]** Raw \`git commit\` blocked. Dispatch the \`commit\` agent instead (Agent tool, subagent_type: 'commit')."
+  MSG="Raw git commit blocked - use commit agent"
+  printf '%s\n' "{\"decision\":\"block\",\"reason\":\"$MSG\"}"
   exit 2
 fi
 
@@ -164,7 +166,8 @@ if echo "$FIRST_LINE" | grep -qE "^(cd[[:space:]]+[^[:space:]]+[[:space:]]+&&[[:
 fi
 # Block any other git push invocation
 if echo "$FIRST_LINE" | grep -qE "(^|[[:space:]])git[[:space:]]+push"; then
-  echo "**[CAST]** Raw \`git push\` blocked. Ensure code-reviewer has run, then use \`CAST_PUSH_OK=1 git push\` or dispatch via the commit agent workflow."
+  MSG="Raw git push blocked - ensure code-reviewer has run, then use CAST_PUSH_OK=1 git push or dispatch via the commit agent workflow"
+  printf '%s\n' "{\"decision\":\"block\",\"reason\":\"$MSG\"}"
   exit 2
 fi
 
