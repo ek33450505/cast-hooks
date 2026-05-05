@@ -100,6 +100,18 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "id": "cast-session-end-stop",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/scripts/cast-session-end.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "id": "cast-session-end",
