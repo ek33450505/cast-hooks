@@ -140,6 +140,10 @@ Timeout tuning: increase `timeout` values if hooks time out on slow machines. Th
 - Python 3.9+
 - SQLite3
 
+## Part of CAST
+
+cast-hooks ships as part of the [CAST framework](https://github.com/ek33450505/claude-agent-team). If you install CAST, you get the full hook layer automatically. This standalone repo is for Claude Code users who want just the hooks — observability, safety gates, and dispatch directives — without the full agent team.
+
 ## CAST Ecosystem
 
 Each CAST component ships as a standalone Homebrew package. Mix and match to build your own stack.
