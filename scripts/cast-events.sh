@@ -26,32 +26,6 @@ CAST_STATE_DIR="${CAST_DIR}/state"
 CAST_REVIEWS_DIR="${CAST_DIR}/reviews"
 CAST_ARTIFACTS_DIR="${CAST_DIR}/artifacts"
 
-# --- API key resolution (priority: env var override > Keychain > unset) ---
-# Keychain is the PRIMARY source on macOS. The env var acts as an override:
-# if ANTHROPIC_API_KEY is already set in the environment, it wins and we skip
-# the Keychain lookup entirely. If neither is available, we continue without it.
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]] && [[ "$(uname -s)" == "Darwin" ]]; then
-  _keychain_key=$(security find-generic-password -s cast-anthropic-api-key -a cast -w 2>/dev/null || true)
-  if [[ -n "$_keychain_key" ]]; then
-    export ANTHROPIC_API_KEY="$_keychain_key"
-  fi
-  unset _keychain_key
-fi
-
-# --- Connectivity check utility ---
-# Calls cast-connectivity.sh check if available. Returns 0=online, 1=offline.
-cast_check_connectivity() {
-  local script="${CAST_SCRIPTS_DIR:-${HOME}/.claude/scripts}/cast-connectivity.sh"
-  if [[ -x "$script" ]]; then
-    "$script" check >/dev/null 2>&1
-    return $?
-  else
-    # Fallback: direct ping check
-    ping -c 1 -W 2 api.anthropic.com >/dev/null 2>&1
-    return $?
-  fi
-}
-
 _cast_init_dirs() {
   mkdir -p "$CAST_EVENTS_DIR" "$CAST_STATE_DIR" "$CAST_REVIEWS_DIR" "$CAST_ARTIFACTS_DIR"
 }
@@ -66,7 +40,7 @@ cast_emit_event() {
   local task_id="$3"
   local artifact_id="${4:-}"
   local summary="${5:-}"
-  local run_status="${6:-}"
+  local status="${6:-}"
   local concerns="${7:-}"
 
   _cast_init_dirs
@@ -75,10 +49,9 @@ cast_emit_event() {
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   local ts_iso
   ts_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local safe_task_id="${task_id//\//-}"
-  local event_file="${CAST_EVENTS_DIR}/${ts}-${agent}-${safe_task_id}.json"
+  local event_file="${CAST_EVENTS_DIR}/${ts}-${agent}-${task_id}.json"
 
-  python3 - "$event_type" "$agent" "$task_id" "$artifact_id" "$summary" "$run_status" "$concerns" "$ts" "$event_file" "$ts_iso" <<'PYEOF'
+  python3 - "$event_type" "$agent" "$task_id" "$artifact_id" "$summary" "$status" "$concerns" "$ts" "$event_file" "$ts_iso" <<'PYEOF'
 import json, sys
 event_type, agent, task_id, artifact_id, summary, status, concerns, ts, filepath, ts_iso = sys.argv[1:]
 event = {
@@ -102,7 +75,7 @@ PYEOF
   # Only for actionable event types; skip artifact/review noise
   if [[ "$event_type" == "task_claimed" || "$event_type" == "task_completed" || "$event_type" == "task_blocked" ]]; then
     CAST_ETYPE="$event_type" CAST_AGENT="$agent" CAST_TASK="$task_id" \
-    CAST_SUMMARY="$summary" CAST_STATUS="$run_status" CAST_TS="$ts_iso" \
+    CAST_SUMMARY="$summary" CAST_STATUS="$status" CAST_TS="$ts_iso" \
     python3 -c "
 import json, os
 etype   = os.environ.get('CAST_ETYPE', '')
@@ -126,7 +99,7 @@ entry = {
 }
 import subprocess
 subprocess.run(
-    ['python3', os.path.join(os.environ.get('CAST_SCRIPTS_DIR', os.path.expanduser('~/.claude/scripts')), 'cast-db-log.py')],
+    ['python3', os.path.expanduser('~/.claude/scripts/cast-db-log.py')],
     input=json.dumps(entry), text=True, timeout=5
 )
 " 2>/dev/null || true

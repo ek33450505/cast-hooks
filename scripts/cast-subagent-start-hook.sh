@@ -21,11 +21,6 @@
 # Never fail loudly — a broken hook must not interrupt the parent session.
 set +e
 
-# Skip nested invocations (subprocess agents)
-if [[ "${CLAUDE_SUBPROCESS:-0}" == "1" ]]; then
-  exit 0
-fi
-
 CAST_DIR="${HOME}/.claude/cast"
 EVENTS_DIR="${CAST_DIR}/events"
 DB_PATH="${CAST_DB_PATH:-${HOME}/.claude/cast.db}"
@@ -34,6 +29,7 @@ mkdir -p "${HOME}/.claude/logs" 2>/dev/null || true
 mkdir -p "$EVENTS_DIR" 2>/dev/null || true
 
 # _log_error: append a structured error line to hook-errors.log (never fails itself)
+# shellcheck disable=SC2317
 _log_error() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ERROR $0: $1" >> "${HOME}/.claude/logs/hook-errors.log" 2>/dev/null || true; }
 
 # Read stdin once

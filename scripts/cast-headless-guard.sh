@@ -37,7 +37,7 @@ except Exception:
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] HEADLESS STALL INTERCEPTED: $QUESTION" >> "$LOG_FILE"
 
     # Return a safe default answer — proceed without further clarification
-    echo '{"updatedInput": {"answer": "Proceed with the safest default option. Do not ask for further clarification."}, "permissionDecision": "allow"}'
+    echo '{"updatedInput": {"answer": "Proceed with the safest default option. Do not ask for further clarification."}}'
     exit 0
 fi
 

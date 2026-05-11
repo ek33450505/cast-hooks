@@ -1,98 +1,103 @@
-#!/bin/bash
-# cast-merge-settings.sh — CAST managed-settings.d/ fragment merger
-# Reads all *.json fragments from ~/.claude/managed-settings.d/ in lexicographic order,
-# deep-merges them (hooks arrays concatenated, all other keys merged), and writes the
-# result to ~/.claude/settings.json (or the path given as $1).
+#!/usr/bin/env bash
+# cast-merge-settings.sh — Merge cast-hooks settings into user's settings.json
 #
-# Usage:
-#   cast-merge-settings.sh [output_path]
-#
-# Exit codes:
-#   0 — success
-#   1 — fragment dir missing or no fragments found
-#   2 — invalid JSON in a fragment (output NOT written)
-#   3 — merged output failed JSON validation
+# Usage: bash cast-merge-settings.sh [--yes]
+#   --yes  Skip confirmation prompt
 
-set -euo pipefail
+set -uo pipefail
 
-OUTPUT="${1:-${HOME}/.claude/settings.json}"
-FRAGMENT_DIR="${HOME}/.claude/managed-settings.d"
+USER_SETTINGS="${HOME}/.claude/settings.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+HOOKS_SETTINGS="${REPO_DIR}/config/settings.json"
 
-if [ ! -d "$FRAGMENT_DIR" ]; then
-  echo "[cast-merge-settings] ERROR: fragment dir not found: $FRAGMENT_DIR" >&2
-  exit 1
+# ── Colors ────────────────────────────────────────────────────────────────────
+if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
+  C_BOLD='\033[1m' C_GREEN='\033[0;32m' C_YELLOW='\033[0;33m' C_RED='\033[0;31m' C_RESET='\033[0m'
+else
+  C_BOLD='' C_GREEN='' C_YELLOW='' C_RED='' C_RESET=''
 fi
 
-# Collect fragments in sort order
-FRAGMENTS=()
-while IFS= read -r -d '' f; do
-  FRAGMENTS+=("$f")
-done < <(find "$FRAGMENT_DIR" -maxdepth 1 -name '*.json' -print0 | sort -z)
+_ok()   { printf '%s  [ok]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+_warn() { printf '%s  [warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+_fail() { printf '%s  [fail]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
-if [ ${#FRAGMENTS[@]} -eq 0 ]; then
-  echo "[cast-merge-settings] ERROR: no *.json fragments found in $FRAGMENT_DIR" >&2
-  exit 1
+# ── Validate source ──────────────────────────────────────────────────────────
+if [ ! -f "$HOOKS_SETTINGS" ]; then
+  _fail "Hook settings not found: $HOOKS_SETTINGS"
 fi
 
-# Validate all fragments before merging
-# Fragments are passed as argv (not string interpolation) to avoid path injection.
-for f in "${FRAGMENTS[@]}"; do
-  if ! python3 - "$f" <<'PYEOF' 2>/dev/null
+python3 -c "import json; json.load(open('$HOOKS_SETTINGS'))" 2>/dev/null || _fail "Invalid JSON in $HOOKS_SETTINGS"
+
+# ── Create user settings if missing ──────────────────────────────────────────
+mkdir -p "${HOME}/.claude"
+if [ ! -f "$USER_SETTINGS" ]; then
+  echo '{}' > "$USER_SETTINGS"
+  _ok "Created $USER_SETTINGS"
+fi
+
+# ── Confirmation ──────────────────────────────────────────────────────────────
+if [ "${1:-}" != "--yes" ] && [ "${CI:-}" != "true" ]; then
+  printf '\n%sMerge cast-hooks into %s?%s\n' "$C_BOLD" "$USER_SETTINGS" "$C_RESET"
+  printf "  This will add/update hook entries. Existing non-hook settings are preserved.\n"
+  printf "  A backup will be created first.\n\n"
+  printf "  Proceed? [Y/n] "
+  read -r reply 2>/dev/null || reply="n"
+  case "${reply}" in
+    [Yy]*|"") ;;
+    *) echo "Aborted."; exit 0 ;;
+  esac
+fi
+
+# ── Backup ────────────────────────────────────────────────────────────────────
+BACKUP="${USER_SETTINGS}.bak"
+cp "$USER_SETTINGS" "$BACKUP"
+_ok "Backup saved to ${BACKUP}"
+
+# ── Merge ─────────────────────────────────────────────────────────────────────
+python3 << PYEOF
 import json, sys
-json.load(open(sys.argv[1]))
-PYEOF
-  then
-    echo "[cast-merge-settings] ERROR: invalid JSON in fragment: $f — aborting, output not written" >&2
-    exit 2
-  fi
-done
 
-# Deep-merge fragments using Python
-MERGED=$(python3 - "${FRAGMENTS[@]}" <<'PYEOF'
-import json
-import sys
+with open("$USER_SETTINGS") as f:
+    user = json.load(f)
 
-def merge(base, override):
-    """Deep-merge override into base. Hooks arrays are concatenated. All other keys are merged recursively."""
-    if not isinstance(base, dict) or not isinstance(override, dict):
-        return override
-    result = dict(base)
-    for key, val in override.items():
-        if key == "hooks" and isinstance(val, dict) and isinstance(result.get("hooks"), dict):
-            # Merge hooks dicts: concatenate arrays for each event key
-            merged_hooks = dict(result["hooks"])
-            for event, arr in val.items():
-                if event in merged_hooks:
-                    merged_hooks[event] = merged_hooks[event] + arr
-                else:
-                    merged_hooks[event] = arr
-            result["hooks"] = merged_hooks
-        elif key in result and isinstance(result[key], dict) and isinstance(val, dict):
-            result[key] = merge(result[key], val)
+with open("$HOOKS_SETTINGS") as f:
+    hooks = json.load(f)
+
+# Merge hooks: for each event, add/update entries by id
+if "hooks" not in user:
+    user["hooks"] = {}
+
+added = 0
+updated = 0
+
+for event, entries in hooks.get("hooks", {}).items():
+    if event not in user["hooks"]:
+        user["hooks"][event] = []
+
+    existing_ids = {e.get("id") for e in user["hooks"][event] if isinstance(e, dict)}
+
+    for entry in entries:
+        entry_id = entry.get("id", "")
+        if entry_id in existing_ids:
+            # Update existing
+            user["hooks"][event] = [entry if e.get("id") == entry_id else e for e in user["hooks"][event]]
+            updated += 1
         else:
-            result[key] = val
-    return result
+            user["hooks"][event].append(entry)
+            added += 1
 
-files = sys.argv[1:]
-combined = {}
-for fpath in files:
-    with open(fpath) as f:
-        fragment = json.load(f)
-    combined = merge(combined, fragment)
+with open("$USER_SETTINGS", "w") as f:
+    json.dump(user, f, indent=2)
+    f.write("\n")
 
-print(json.dumps(combined, indent=2))
+print(f"  Added {added} hook(s), updated {updated} hook(s)")
 PYEOF
-)
+MERGE_EXIT=$?
 
-# Validate merged output
-if ! echo "$MERGED" | python3 -m json.tool > /dev/null 2>&1; then
-  echo "[cast-merge-settings] ERROR: merged output is invalid JSON — output not written" >&2
-  exit 3
+if [ "$MERGE_EXIT" -eq 0 ]; then
+  _ok "Settings merged successfully"
+else
+  cp "$BACKUP" "$USER_SETTINGS"
+  _fail "Merge failed — backup restored"
 fi
-
-# Write atomically via temp file
-TMP_OUT=$(mktemp "${OUTPUT}.tmp.XXXXXX")
-echo "$MERGED" > "$TMP_OUT"
-mv "$TMP_OUT" "$OUTPUT"
-
-echo "[cast-merge-settings] merged ${#FRAGMENTS[@]} fragments → $OUTPUT"

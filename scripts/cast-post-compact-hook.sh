@@ -7,10 +7,6 @@ if [ "${CLAUDE_SUBPROCESS:-0}" = "1" ]; then exit 0; fi
 
 set -euo pipefail
 
-# _log_error: append a structured error line to hook-errors.log (never fails itself)
-mkdir -p "${HOME}/.claude/logs" 2>/dev/null || true
-_log_error() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ERROR $0: $1" >> "${HOME}/.claude/logs/hook-errors.log" 2>/dev/null || true; }
-
 INPUT="$(cat 2>/dev/null || true)"
 
 # Touch marker for dashboard hook health
@@ -81,7 +77,7 @@ except Exception:
 
 # Write compaction tier to cast.db (best-effort — hook must not fail)
 import sys
-sys.path.insert(0, os.environ.get('CAST_SCRIPTS_DIR', os.path.expanduser('~/.claude/scripts')))
+sys.path.insert(0, os.path.expanduser('~/.claude/scripts'))
 try:
     from cast_db import db_execute, db_write
     db_execute('''

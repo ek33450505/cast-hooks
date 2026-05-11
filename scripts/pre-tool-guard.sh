@@ -32,10 +32,7 @@ ti = d.get('tool_input', {})
 print(ti.get('file_path', ti.get('path', '')))" 2>/dev/null || echo "")"
 
   if [ -n "$FILE_PATH" ]; then
-    # TTL sweep: remove agent-status files older than 2 hours (matches SESSION_TIMEOUT=7200)
-    find "${CLAUDE_DIR:-$HOME/.claude}/agent-status/" -name "*.json" -mmin +120 -delete 2>/dev/null || true
-
-    CAST_FILE_PATH="$FILE_PATH" CAST_POLICY_OVERRIDE="${CAST_POLICY_OVERRIDE:-0}" python3 -c "
+    CAST_FILE_PATH="$FILE_PATH" CAST_POLICY_OVERRIDE="${CAST_POLICY_OVERRIDE:-0}" python3 - <<'PYEOF' 2>/dev/null
 import json, os, re, sys, datetime
 
 file_path = os.environ.get('CAST_FILE_PATH', '')
@@ -103,7 +100,7 @@ for policy in config.get('policies', []):
 
     if severity == 'block':
         if override:
-            print(f'[CAST-POLICY-WARN] Policy \"{policy_id}\" bypassed via CAST_POLICY_OVERRIDE=1. Requires: {required_agent}', file=sys.stderr)
+            print(f'[CAST-POLICY-WARN] Policy "{policy_id}" bypassed via CAST_POLICY_OVERRIDE=1. Requires: {required_agent}', file=sys.stderr)
             import datetime as _dt, json as _json
             audit_path = os.path.expanduser('~/.claude/logs/audit.jsonl')
             os.makedirs(os.path.dirname(audit_path), exist_ok=True)
@@ -122,18 +119,19 @@ for policy in config.get('policies', []):
                 pass
             sys.exit(0)
         else:
+            import json as _json
             msg = (
-                f'**[CAST-POLICY-BLOCK]** Policy \"{policy_id}\" blocks this edit.\\n'
-                f'Reason: {description}\\n'
-                f'Required: Dispatch the \`{required_agent}\` agent before editing \`{file_path}\`.\\n'
+                f'[CAST-POLICY-BLOCK] Policy "{policy_id}" blocks this edit. '
+                f'Reason: {description} '
+                f'Required: Dispatch the `{required_agent}` agent before editing `{file_path}`. '
                 f'Escape hatch: Set CAST_POLICY_OVERRIDE=1 to bypass (document your reason).'
             )
-            print(msg)
+            print(_json.dumps({"decision": "block", "reason": msg}))
             sys.exit(2)
     else:
         # severity == warn
-        print(f'[CAST-POLICY-WARN] Policy \"{policy_id}\": {description}. Consider dispatching \`{required_agent}\` first.', file=sys.stderr)
-" 2>/dev/null
+        print(f'[CAST-POLICY-WARN] Policy "{policy_id}": {description}. Consider dispatching `{required_agent}` first.', file=sys.stderr)
+PYEOF
     EXIT_CODE=$?
     if [ $EXIT_CODE -eq 2 ]; then
       exit 2
@@ -150,32 +148,26 @@ fi
 FIRST_LINE="${CMD%%$'\n'*}"
 
 # --- git commit block ---
-# Allow commits from authorized subagent sessions (CLAUDE_SUBPROCESS=1 is set by Claude Code)
-if [ "${CLAUDE_SUBPROCESS:-0}" = "1" ]; then
-  exit 0
-fi
-# Allow ONLY if escape hatch env var appears before git commit (tolerates leading cd chains)
-if echo "$FIRST_LINE" | grep -qE "(^|&&[[:space:]]*)CAST_COMMIT_AGENT=1[[:space:]]+git[[:space:]]+commit"; then
+# Allow ONLY if escape hatch is a leading env assignment immediately before git commit
+if echo "$FIRST_LINE" | grep -qE "^(cd[[:space:]]+[^[:space:]]+[[:space:]]+&&[[:space:]]+)?CAST_COMMIT_AGENT=1[[:space:]]+git[[:space:]]+commit"; then
   exit 0
 fi
 # Block any other git commit invocation
 if echo "$FIRST_LINE" | grep -qE "(^|[[:space:]])git[[:space:]]+commit"; then
-  echo "**[CAST]** Raw \`git commit\` blocked. Dispatch the \`commit\` agent instead (Agent tool, subagent_type: 'commit')."
+  MSG="Raw git commit blocked - use commit agent"
+  printf '%s\n' "{\"decision\":\"block\",\"reason\":\"$MSG\"}"
   exit 2
 fi
 
 # --- git push block ---
-# Allow pushes from authorized subagent sessions (CLAUDE_SUBPROCESS=1 is set by Claude Code)
-if [ "${CLAUDE_SUBPROCESS:-0}" = "1" ]; then
-  exit 0
-fi
-# Allow ONLY if escape hatch env var appears before git push (tolerates leading cd chains)
-if echo "$FIRST_LINE" | grep -qE "(^|&&[[:space:]]*)CAST_PUSH_OK=1[[:space:]]+git[[:space:]]+push"; then
+# Allow ONLY if escape hatch is a leading env assignment immediately before git push
+if echo "$FIRST_LINE" | grep -qE "^(cd[[:space:]]+[^[:space:]]+[[:space:]]+&&[[:space:]]+)?CAST_PUSH_OK=1[[:space:]]+git[[:space:]]+push"; then
   exit 0
 fi
 # Block any other git push invocation
 if echo "$FIRST_LINE" | grep -qE "(^|[[:space:]])git[[:space:]]+push"; then
-  echo "**[CAST]** Raw \`git push\` blocked. Ensure code-reviewer has run, then use \`CAST_PUSH_OK=1 git push\` or dispatch via the commit agent workflow."
+  MSG="Raw git push blocked - ensure code-reviewer has run, then use CAST_PUSH_OK=1 git push or dispatch via the commit agent workflow"
+  printf '%s\n' "{\"decision\":\"block\",\"reason\":\"$MSG\"}"
   exit 2
 fi
 
