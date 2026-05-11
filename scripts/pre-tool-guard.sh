@@ -32,7 +32,7 @@ ti = d.get('tool_input', {})
 print(ti.get('file_path', ti.get('path', '')))" 2>/dev/null || echo "")"
 
   if [ -n "$FILE_PATH" ]; then
-    CAST_FILE_PATH="$FILE_PATH" CAST_POLICY_OVERRIDE="${CAST_POLICY_OVERRIDE:-0}" python3 -c "
+    CAST_FILE_PATH="$FILE_PATH" CAST_POLICY_OVERRIDE="${CAST_POLICY_OVERRIDE:-0}" python3 - <<'PYEOF' 2>/dev/null
 import json, os, re, sys, datetime
 
 file_path = os.environ.get('CAST_FILE_PATH', '')
@@ -100,7 +100,7 @@ for policy in config.get('policies', []):
 
     if severity == 'block':
         if override:
-            print(f'[CAST-POLICY-WARN] Policy \"{policy_id}\" bypassed via CAST_POLICY_OVERRIDE=1. Requires: {required_agent}', file=sys.stderr)
+            print(f'[CAST-POLICY-WARN] Policy "{policy_id}" bypassed via CAST_POLICY_OVERRIDE=1. Requires: {required_agent}', file=sys.stderr)
             import datetime as _dt, json as _json
             audit_path = os.path.expanduser('~/.claude/logs/audit.jsonl')
             os.makedirs(os.path.dirname(audit_path), exist_ok=True)
@@ -130,8 +130,8 @@ for policy in config.get('policies', []):
             sys.exit(2)
     else:
         # severity == warn
-        print(f'[CAST-POLICY-WARN] Policy \"{policy_id}\": {description}. Consider dispatching \`{required_agent}\` first.', file=sys.stderr)
-" 2>/dev/null
+        print(f'[CAST-POLICY-WARN] Policy "{policy_id}": {description}. Consider dispatching `{required_agent}` first.', file=sys.stderr)
+PYEOF
     EXIT_CODE=$?
     if [ $EXIT_CODE -eq 2 ]; then
       exit 2
