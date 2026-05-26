@@ -37,6 +37,11 @@
 # Audit hook must never fail loudly — a broken audit hook must not interrupt work.
 set +e
 
+# Subagent sessions skip audit to prevent double-logging in nested agent runs.
+if [[ "${CLAUDE_SUBPROCESS:-0}" == "1" ]]; then
+  exit 0
+fi
+
 # C5: PII bypass safelist — known false-positive patterns skip enforcement
 SAFELIST_PATTERNS=(
   'anthropic\.com'
