@@ -12,7 +12,7 @@
 
 Hook scripts are shell commands that Claude Code executes at specific lifecycle events — session start, tool use, agent dispatch, compaction, session end. They run automatically in the background, logging everything to `cast.db` (SQLite) and injecting directives like `[CAST-CHAIN]` and `[CAST-REVIEW]` into the conversation when conditions are met.
 
-cast-hooks gives you the hook layer without requiring the full CAST framework, its 30 agents, or its orchestrator. Install the hooks, merge the settings, and Claude Code starts producing structured observability data immediately.
+cast-hooks gives you the hook layer without requiring the full CAST framework, its 23 agents, or its orchestrator. Install the hooks, merge the settings, and Claude Code starts producing structured observability data immediately.
 
 ## Install
 
