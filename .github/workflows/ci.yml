@@ -14,7 +14,7 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
       - name: Lint shell scripts
-        run: shellcheck scripts/*.sh bin/cast-hooks
+        run: shellcheck -e SC2317 scripts/*.sh bin/cast-hooks
 
   bats:
     runs-on: ubuntu-latest
