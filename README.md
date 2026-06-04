@@ -105,7 +105,7 @@ cast-hooks v0.2.0 — Active Status
 cast-hooks install
 ```
 
-This copies all 19 scripts (13 hooks + 6 supporting) to `~/.claude/scripts/`, initializes the cast.db schema, and merges hook entries into your `~/.claude/settings.json`.
+This copies all 20 scripts (13 hooks + 7 supporting) to `~/.claude/scripts/`, initializes the cast.db schema, and merges hook entries into your `~/.claude/settings.json`.
 
 ## How hooks work
 
