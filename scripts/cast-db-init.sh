@@ -472,8 +472,522 @@ fi
 sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_agent_runs_batch_id ON agent_runs(batch_id);" 2>/dev/null || true
 sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_id ON agent_runs(agent_id);" 2>/dev/null || true
 
+# ── Phase 3+: provision tables that have live writers but were missing from earlier
+# versions of this script. All blocks are guarded by .tables checks — idempotent. ──
+
+# injection_log: memory retrieval telemetry (writer: cast-memory-router.py)
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "injection_log"; then
+  sqlite3 "$DB_PATH" <<'INJECTION_LOG_TABLE'
+CREATE TABLE IF NOT EXISTS injection_log (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id      TEXT,
+  prompt_hash     TEXT,
+  fact_id         INTEGER,
+  score           REAL,
+  score_breakdown TEXT,
+  injected_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_injection_log_session     ON injection_log(session_id);
+CREATE INDEX IF NOT EXISTS idx_injection_log_injected_at ON injection_log(injected_at);
+INJECTION_LOG_TABLE
+  _columns_added=1
+fi
+
+# quality_gates: per-agent contract compliance (writers: cast-subagent-stop-hook.sh)
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "quality_gates"; then
+  sqlite3 "$DB_PATH" <<'QUALITY_GATES_TABLE'
+CREATE TABLE IF NOT EXISTS quality_gates (
+  id              TEXT PRIMARY KEY,
+  session_id      TEXT,
+  batch_id        INTEGER,
+  agent_name      TEXT,
+  timestamp       TEXT,
+  status_line     TEXT,
+  contract_passed INTEGER,
+  retry_count     INTEGER,
+  gate_type       TEXT,
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_quality_gates_session    ON quality_gates(session_id);
+CREATE INDEX IF NOT EXISTS idx_quality_gates_gate_type  ON quality_gates(gate_type);
+CREATE INDEX IF NOT EXISTS idx_quality_gates_created_at ON quality_gates(created_at);
+QUALITY_GATES_TABLE
+  _columns_added=1
+fi
+
+# dispatch_decisions: routing telemetry
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "dispatch_decisions"; then
+  sqlite3 "$DB_PATH" <<'DISPATCH_DECISIONS_TABLE'
+CREATE TABLE IF NOT EXISTS dispatch_decisions (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id      TEXT,
+  prompt_snippet  TEXT,
+  chosen_agent    TEXT,
+  model           TEXT,
+  effort          TEXT,
+  wave_id         TEXT,
+  parallel        INTEGER DEFAULT 0,
+  created_at      TEXT DEFAULT (datetime('now')),
+  outcome         TEXT DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_decisions_session    ON dispatch_decisions(session_id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_decisions_agent      ON dispatch_decisions(chosen_agent);
+CREATE INDEX IF NOT EXISTS idx_dispatch_decisions_created_at ON dispatch_decisions(created_at);
+DISPATCH_DECISIONS_TABLE
+  _columns_added=1
+fi
+
+# task_queue: persistent agent task queue
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "task_queue"; then
+  sqlite3 "$DB_PATH" <<'TASK_QUEUE_TABLE'
+CREATE TABLE IF NOT EXISTS task_queue (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent         TEXT NOT NULL,
+  task          TEXT NOT NULL,
+  priority      INTEGER DEFAULT 5,
+  status        TEXT DEFAULT 'pending',
+  created_at    TEXT DEFAULT (datetime('now')),
+  claimed_at    TEXT,
+  completed_at  TEXT,
+  retry_count   INTEGER DEFAULT 0,
+  max_retries   INTEGER DEFAULT 3,
+  project       TEXT,
+  project_root  TEXT,
+  scheduled_for TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_queue_status     ON task_queue(status);
+CREATE INDEX IF NOT EXISTS idx_task_queue_created_at ON task_queue(created_at);
+TASK_QUEUE_TABLE
+  _columns_added=1
+fi
+
+# routines: scheduled-agent definitions (writer: cast-db-routines.py)
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "routines"; then
+  sqlite3 "$DB_PATH" <<'ROUTINES_TABLE'
+CREATE TABLE IF NOT EXISTS routines (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  trigger_type TEXT NOT NULL,
+  trigger_value TEXT,
+  agent_to_dispatch TEXT NOT NULL,
+  prompt_template TEXT NOT NULL,
+  output_dir TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_run_at TEXT,
+  last_run_status TEXT,
+  last_run_output_path TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_routines_name ON routines(name);
+CREATE INDEX IF NOT EXISTS idx_routines_trigger ON routines(trigger_type, enabled);
+ROUTINES_TABLE
+  _columns_added=1
+fi
+
+# incidents: incident log
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "incidents"; then
+  sqlite3 "$DB_PATH" <<'INCIDENTS_TABLE'
+CREATE TABLE IF NOT EXISTS incidents (
+  id TEXT PRIMARY KEY,
+  occurred_at TEXT NOT NULL,
+  problem_summary TEXT NOT NULL,
+  fix_summary TEXT,
+  related_files TEXT,
+  related_commit TEXT,
+  resolution_status TEXT,
+  surfaced_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_occurred ON incidents(occurred_at);
+INCIDENTS_TABLE
+  _columns_added=1
+fi
+
+# plan_sessions: links an orchestrate session to its plan file
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "plan_sessions"; then
+  sqlite3 "$DB_PATH" <<'PLAN_SESSIONS_TABLE'
+CREATE TABLE IF NOT EXISTS plan_sessions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  plan_file  TEXT NOT NULL,
+  started_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_sessions_session ON plan_sessions(session_id);
+PLAN_SESSIONS_TABLE
+  _columns_added=1
+fi
+
+# memory_consolidation_runs: consolidation telemetry
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "memory_consolidation_runs"; then
+  sqlite3 "$DB_PATH" <<'MEM_CONSOLIDATION_TABLE'
+CREATE TABLE IF NOT EXISTS memory_consolidation_runs (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id              TEXT NOT NULL UNIQUE,
+  project_id          TEXT NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'pending',
+  instructions        TEXT,
+  input_fingerprint   TEXT,
+  output_path         TEXT,
+  error               TEXT,
+  started_at          TEXT,
+  completed_at        TEXT,
+  memory_files_read   INTEGER DEFAULT 0,
+  transcripts_scanned INTEGER DEFAULT 0,
+  candidates_written  INTEGER DEFAULT 0,
+  created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mcr_status ON memory_consolidation_runs(status);
+MEM_CONSOLIDATION_TABLE
+  _columns_added=1
+fi
+
+# archived_memories: low-importance memories moved out of agent_memories
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "archived_memories"; then
+  sqlite3 "$DB_PATH" <<'ARCHIVED_MEMORIES_TABLE'
+CREATE TABLE IF NOT EXISTS archived_memories (
+  id          INTEGER PRIMARY KEY,
+  agent       TEXT,
+  project     TEXT,
+  type        TEXT,
+  name        TEXT,
+  description TEXT,
+  content     TEXT,
+  created_at  TEXT,
+  updated_at  TEXT,
+  confidence  REAL,
+  importance  REAL,
+  decay_rate  REAL,
+  valid_from  TEXT,
+  valid_to    TEXT,
+  superseded_by INTEGER,
+  source_type TEXT,
+  embedding   BLOB,
+  last_validated_at TEXT,
+  retrieval_count INTEGER,
+  archived_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_archived_memories_agent ON archived_memories(agent);
+ARCHIVED_MEMORIES_TABLE
+  _columns_added=1
+fi
+
+# budgets: per-scope cost limits
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "budgets"; then
+  sqlite3 "$DB_PATH" <<'BUDGETS_TABLE'
+CREATE TABLE IF NOT EXISTS budgets (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope        TEXT,
+  scope_key    TEXT,
+  period       TEXT,
+  limit_usd    REAL,
+  alert_at_pct REAL,
+  created_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_budgets_scope ON budgets(scope, period);
+BUDGETS_TABLE
+  _columns_added=1
+fi
+
+# agent_protocol_violations: protocol-violation tracking
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "agent_protocol_violations"; then
+  sqlite3 "$DB_PATH" <<'AGENT_PROTOCOL_VIOLATIONS_TABLE'
+CREATE TABLE IF NOT EXISTS agent_protocol_violations (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id   TEXT,
+  agent_type   TEXT NOT NULL,
+  agent_id     TEXT,
+  batch_id     INTEGER,
+  violation    TEXT NOT NULL,
+  pattern      TEXT,
+  timestamp    TEXT NOT NULL,
+  raw_excerpt  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_apv_session ON agent_protocol_violations(session_id);
+CREATE INDEX IF NOT EXISTS idx_apv_agent_type ON agent_protocol_violations(agent_type);
+CREATE INDEX IF NOT EXISTS idx_apv_timestamp ON agent_protocol_violations(timestamp);
+AGENT_PROTOCOL_VIOLATIONS_TABLE
+  _columns_added=1
+fi
+
+# file_writes: IDE gutter annotation telemetry (writer: cast-post-tool.py)
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "file_writes"; then
+  sqlite3 "$DB_PATH" <<'FILE_WRITES_TABLE'
+CREATE TABLE IF NOT EXISTS file_writes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT,
+  agent_name  TEXT,
+  run_id      INTEGER,
+  file_path   TEXT NOT NULL,
+  tool_name   TEXT NOT NULL,
+  ts          TEXT NOT NULL DEFAULT (datetime('now')),
+  line_range  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_file_writes_path        ON file_writes(file_path);
+CREATE INDEX IF NOT EXISTS idx_file_writes_session_ts  ON file_writes(session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_file_writes_run         ON file_writes(run_id);
+FILE_WRITES_TABLE
+  _columns_added=1
+fi
+
+# unstaged_warnings: git staging enforcement
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "unstaged_warnings"; then
+  sqlite3 "$DB_PATH" <<'UNSTAGED_WARNINGS_TABLE'
+CREATE TABLE IF NOT EXISTS unstaged_warnings (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id      TEXT,
+  commit_sha      TEXT,
+  unstaged_files  TEXT,
+  in_scope_files  TEXT,
+  timestamp       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_uw_session ON unstaged_warnings(session_id);
+CREATE INDEX IF NOT EXISTS idx_uw_timestamp ON unstaged_warnings(timestamp);
+UNSTAGED_WARNINGS_TABLE
+  _columns_added=1
+fi
+
+# managed_agent_invocations: Managed Agents telemetry
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "managed_agent_invocations"; then
+  sqlite3 "$DB_PATH" <<'MANAGED_AGENT_INVOCATIONS_TABLE'
+CREATE TABLE IF NOT EXISTS managed_agent_invocations (
+  id TEXT PRIMARY KEY,
+  ts TEXT,
+  agent_name TEXT,
+  mode TEXT,
+  http_status INTEGER,
+  exit_code INTEGER,
+  session_duration_ms INTEGER
+);
+MANAGED_AGENT_INVOCATIONS_TABLE
+  _columns_added=1
+fi
+
+# contract_test_runs: agent contract testing
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "contract_test_runs"; then
+  sqlite3 "$DB_PATH" <<'CONTRACT_TEST_RUNS_TABLE'
+CREATE TABLE IF NOT EXISTS contract_test_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent TEXT,
+  fixture TEXT,
+  result TEXT,
+  timestamp TEXT
+);
+CONTRACT_TEST_RUNS_TABLE
+  _columns_added=1
+fi
+
+# dispatch_events: cookbook drift dispatch telemetry
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "dispatch_events"; then
+  sqlite3 "$DB_PATH" <<'DISPATCH_EVENTS_TABLE'
+CREATE TABLE IF NOT EXISTS dispatch_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent TEXT NOT NULL,
+  task_name TEXT,
+  triggered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  status TEXT,
+  report_path TEXT
+);
+DISPATCH_EVENTS_TABLE
+  _columns_added=1
+fi
+
+# rate_limit_snapshots: Anthropic rate limit tracking
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "rate_limit_snapshots"; then
+  sqlite3 "$DB_PATH" <<'RATE_LIMIT_SNAPSHOTS_TABLE'
+CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
+  ts          INTEGER,
+  tpm_limit   INTEGER,
+  tpm_used    INTEGER,
+  rpm_limit   INTEGER,
+  rpm_used    INTEGER,
+  raw_json    TEXT
+);
+RATE_LIMIT_SNAPSHOTS_TABLE
+  _columns_added=1
+fi
+
+# files_api_events: file API observability
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "files_api_events"; then
+  sqlite3 "$DB_PATH" <<'FILES_API_EVENTS_TABLE'
+CREATE TABLE IF NOT EXISTS files_api_events (
+  id TEXT PRIMARY KEY,
+  action TEXT,
+  file_id TEXT,
+  local_path TEXT,
+  agent TEXT,
+  created_at TEXT
+);
+FILES_API_EVENTS_TABLE
+  _columns_added=1
+fi
+
+# batch_dispatches: batch API invocation tracking
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "batch_dispatches"; then
+  sqlite3 "$DB_PATH" <<'BATCH_DISPATCHES_TABLE'
+CREATE TABLE IF NOT EXISTS batch_dispatches (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  custom_id TEXT NOT NULL,
+  prompt_preview TEXT,
+  submitted_at TEXT NOT NULL
+);
+BATCH_DISPATCHES_TABLE
+  _columns_added=1
+fi
+
+# agent_hallucinations: claim verification telemetry
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "agent_hallucinations"; then
+  sqlite3 "$DB_PATH" <<'AGENT_HALLUCINATIONS_TABLE'
+CREATE TABLE IF NOT EXISTS agent_hallucinations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    agent_name TEXT NOT NULL,
+    claim_type TEXT NOT NULL,
+    claimed_value TEXT,
+    actual_value TEXT,
+    verified INTEGER DEFAULT 0,
+    timestamp TEXT
+);
+AGENT_HALLUCINATIONS_TABLE
+  _columns_added=1
+fi
+
+# code_ref_checks: code reference verification
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "code_ref_checks"; then
+  sqlite3 "$DB_PATH" <<'CODE_REF_CHECKS_TABLE'
+CREATE TABLE IF NOT EXISTS code_ref_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    agent_name TEXT,
+    ref_type TEXT,
+    ref_name TEXT,
+    verified INTEGER,
+    location TEXT,
+    timestamp TEXT
+);
+CODE_REF_CHECKS_TABLE
+  _columns_added=1
+fi
+
+# compaction_events: context compaction telemetry
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "compaction_events"; then
+  sqlite3 "$DB_PATH" <<'COMPACTION_EVENTS_TABLE'
+CREATE TABLE IF NOT EXISTS compaction_events (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    timestamp TEXT,
+    trigger TEXT,
+    compaction_tier TEXT,
+    transcript_path TEXT
+);
+COMPACTION_EVENTS_TABLE
+  _columns_added=1
+fi
+
+# completeness_events: agent completeness tracking
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "completeness_events"; then
+  sqlite3 "$DB_PATH" <<'COMPLETENESS_EVENTS_TABLE'
+CREATE TABLE IF NOT EXISTS completeness_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent TEXT NOT NULL,
+    truncated_at TEXT NOT NULL,
+    snippet TEXT,
+    severity TEXT DEFAULT 'MEDIUM',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+COMPLETENESS_EVENTS_TABLE
+  _columns_added=1
+fi
+
+# hook_failures: hook execution failure log
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "hook_failures"; then
+  sqlite3 "$DB_PATH" <<'HOOK_FAILURES_TABLE'
+CREATE TABLE IF NOT EXISTS hook_failures (
+    id TEXT PRIMARY KEY,
+    hook_name TEXT NOT NULL,
+    exit_code INTEGER,
+    stderr TEXT,
+    session_id TEXT,
+    timestamp TEXT NOT NULL
+);
+HOOK_FAILURES_TABLE
+  _columns_added=1
+fi
+
+# pane_bindings: terminal pane session mapping
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "pane_bindings"; then
+  sqlite3 "$DB_PATH" <<'PANE_BINDINGS_TABLE'
+CREATE TABLE IF NOT EXISTS pane_bindings (
+    pane_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    started_at INTEGER,
+    ended_at INTEGER,
+    project_path TEXT
+);
+PANE_BINDINGS_TABLE
+  _columns_added=1
+fi
+
+# stop_failure_events: StopFailure hook telemetry
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "stop_failure_events"; then
+  sqlite3 "$DB_PATH" <<'STOP_FAILURE_EVENTS_TABLE'
+CREATE TABLE IF NOT EXISTS stop_failure_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    event_id TEXT UNIQUE,
+    agent_name TEXT,
+    session_id TEXT,
+    error_message TEXT,
+    source TEXT DEFAULT 'StopFailure',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+STOP_FAILURE_EVENTS_TABLE
+  _columns_added=1
+fi
+
+# worktree_anomalies: agent worktree isolation anomalies
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "worktree_anomalies"; then
+  sqlite3 "$DB_PATH" <<'WORKTREE_ANOMALIES_TABLE'
+CREATE TABLE IF NOT EXISTS worktree_anomalies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT,
+    worktree_path TEXT,
+    detected_at TEXT,
+    repo_root TEXT,
+    state TEXT,
+    reason TEXT
+);
+WORKTREE_ANOMALIES_TABLE
+  _columns_added=1
+fi
+
+# schema_migrations: migration ledger
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "schema_migrations"; then
+  sqlite3 "$DB_PATH" <<'SCHEMA_MIGRATIONS_TABLE'
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+  checksum   TEXT
+);
+SCHEMA_MIGRATIONS_TABLE
+  _columns_added=1
+fi
+
+# Additive columns on core tables (idempotent; duplicate-column errors suppressed)
+sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN owns_files TEXT;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN duration_ms INTEGER;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN tool_uses INTEGER;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE dispatch_decisions ADD COLUMN outcome TEXT DEFAULT 'pending';" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN status TEXT;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN deleted_at TEXT;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN total_input_tokens INTEGER;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN total_output_tokens INTEGER;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN total_cost_usd REAL;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE routing_events ADD COLUMN agent_id TEXT;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE routing_events ADD COLUMN agent_type TEXT;" 2>/dev/null || true
+
 if [ "$_columns_added" -eq 1 ]; then
   echo "[cast-db-init] self-healed: added missing agent_id, batch_id, and/or response columns to agent_runs" >&2
 fi
 
-echo "cast.db initialized (v8, WAL mode, swarm tables included)" >&2
+echo "cast.db initialized (v8, WAL mode, 38 tables)" >&2

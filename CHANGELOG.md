@@ -2,6 +2,17 @@
 
 All notable changes to cast-hooks are documented here.
 
+## [0.2.1] — 2026-06-05 — Security/correctness backport from flagship v7.4.1
+
+### Fixed
+- **cast-subagent-stop-hook.sh**: added the `STATUS_CONTRACT_EXEMPT` guard so built-in agents (general-purpose, Explore, Plan, claude, workflow-subagent) that return StructuredOutput no longer trigger false-positive `[CAST-TRUNCATED]` directives + DB writes.
+- **pre-tool-guard.sh**: git-detection now tolerates global options (e.g. `git -C <path> commit` no longer bypasses the guard) and adds the git-stash block (`CAST_STASH_OK=1` escape hatch).
+- **cast-db-init.sh**: provisions the full 38-table schema (was ~10) so co-installed CAST tools no longer fail/silently-drop writes to missing tables.
+- **cast_db.py**: `ALLOWED_TABLES` now includes `task_queue`; `_allowed_db_prefixes` includes `/var/folders/` (macOS temp-dir test paths).
+
+### Changed
+- README: removed the fictional "Constellation 3D graph" claim; refreshed CAST ecosystem stats.
+
 ## [0.2.0] — 2026-05-11 — Polish + Ecosystem Sync
 
 ### Added
@@ -11,7 +22,7 @@ All notable changes to cast-hooks are documented here.
 
 ### Changed
 - pre-tool-guard.sh: switched python heredoc to single-quoted tag to silence shellcheck false-positives (commit 6367ce1)
-- README agent count updated from 17 to 30 to match current CAST ecosystem (commit 6061028)
+- README agent count updated from 17 to 23 to match current CAST ecosystem (commit 6061028; corrected from the originally-noted "30" which was a transient overcount)
 
 ### Notes
 - A v7 bulk script sync was attempted and reverted on 2026-05-11

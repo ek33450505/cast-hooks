@@ -32,4 +32,3 @@ cast-hooks install  # re-run the install flow (idempotent)
 - `cast-merge-settings.sh` merges hook entries into `~/.claude/settings.json`; it does not overwrite existing keys.
 - DB path: `CAST_DB_PATH` env var overrides the default `~/.claude/cast.db`.
 - `cast_db.py` is the only sanctioned DB abstraction — never call sqlite3 directly from hook scripts.
-- `.claude/worktrees/agent-*` directories are stale cleanup debt — ignore them during development.
