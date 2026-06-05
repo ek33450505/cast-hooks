@@ -38,6 +38,7 @@ ALLOWED_TABLES = {
     'stream_events',
     'tool_call_failures',
     'swarm_sessions',
+    'task_queue',
     'teammate_messages',
     'teammate_runs',
     'unstaged_warnings',
@@ -53,6 +54,9 @@ def _allowed_db_prefixes() -> tuple:
         '/tmp/',
         str(Path('/tmp').resolve()) + os.sep,
         str(Path(tempfile.gettempdir()).resolve()) + os.sep,
+        # macOS system temp: /var/folders/... resolves to /private/var/folders/...
+        '/var/folders/',
+        str(Path('/var/folders').resolve()) + os.sep,
     ]
     bats_tmpdir = os.environ.get('BATS_TEST_TMPDIR') or os.environ.get('BATS_TMPDIR')
     if bats_tmpdir:
