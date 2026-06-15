@@ -97,7 +97,7 @@ sys.exit(0)
   [ "$status" -eq 0 ]
 }
 
-@test "cast-headless-guard emits updatedInput WITHOUT top-level permissionDecision" {
+@test "cast-headless-guard emits updatedInput WITH permissionDecision=allow" {
   INPUT='{"tool_name":"AskUserQuestion","input":{"question":"Should I continue?"}}'
   run bash -c "echo '$INPUT' | bash '$REPO_DIR/scripts/cast-headless-guard.sh'"
   [ "$status" -eq 0 ]
@@ -110,7 +110,7 @@ for line in lines:
         d = json.loads(line)
         if 'updatedInput' in d:
             assert isinstance(d['updatedInput'].get('answer'), str), 'answer must be string'
-            assert 'permissionDecision' not in d, 'permissionDecision must NOT be present at top level'
+            assert d.get('permissionDecision') == 'allow', 'permissionDecision must be present and equal allow'
             sys.exit(0)
     except AssertionError as e:
         print(str(e), file=sys.stderr)
