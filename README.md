@@ -1,7 +1,7 @@
 # cast-hooks
 
 [![CI](https://github.com/ek33450505/cast-hooks/actions/workflows/ci.yml/badge.svg)](https://github.com/ek33450505/cast-hooks/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-0.2.0-blue)
+![version](https://img.shields.io/badge/version-0.3.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![hooks](https://img.shields.io/badge/hooks-13-purple)
@@ -68,7 +68,7 @@ bash install.sh
 ```
 $ cast-hooks list
 
-cast-hooks v0.2.0 — Hook Registry
+cast-hooks v0.3.0 — Hook Registry
 ════════════════════════════════════════════════════════════════════════════
   Hook ID                  Event                  Script                  Timeout  Async
   ──────────────────────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ cast-hooks v0.2.0 — Hook Registry
 ```
 $ cast-hooks status
 
-cast-hooks v0.2.0 — Active Status
+cast-hooks v0.3.0 — Active Status
 ══════════════════════════════════════════════════════════════
   Hook ID                  Event                  Status
   ────────────────────────────────────────────────────────

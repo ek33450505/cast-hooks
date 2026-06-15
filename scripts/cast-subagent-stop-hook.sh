@@ -149,45 +149,110 @@ print(json.dumps(result))
 PYEOF
 )" || true
 
-if [ -z "$PARSED" ] || echo "$PARSED" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); sys.exit(0 if 'error' not in d else 1)" 2>/dev/null; then
-  : # parsed ok or we'll fall through
-else
+# Guard: exit if PARSED is empty or signals a parse error.
+if [ -z "$PARSED" ]; then
   exit 0
 fi
 
-# Extract individual fields via env var
+# Export PARSED so the single-extraction python3 can read it.
 export CAST_STOP_PARSED="$PARSED"
 
-AGENT_NAME="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('agent_name','unknown'))" 2>/dev/null || echo "unknown")"
-SESSION_ID="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('session_id',''))" 2>/dev/null || echo "")"
-STOP_REASON="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('stop_reason',''))" 2>/dev/null || echo "")"
-HAS_TURN_CEILING="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print('1' if d.get('has_turn_ceiling') else '0')" 2>/dev/null || echo "0")"
-AGENT_ID="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('agent_id',''))" 2>/dev/null || echo "")"
-DURATION_MS="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('duration_ms',0))" 2>/dev/null || echo 0)"
-TOOL_USES="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('tool_uses',0))" 2>/dev/null || echo 0)"
-CACHE_READ_TOKENS="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('cache_read_input_tokens') or '')" 2>/dev/null || echo "")"
-CACHE_CREATE_TOKENS="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('cache_creation_input_tokens') or '')" 2>/dev/null || echo "")"
+# ── Single-python field extraction (collapses 9+ spawns into one) ─────────────
+# Emits eval-able KEY='shlex-quoted-value' lines for every field needed downstream.
+# Failure leaves all vars at safe defaults (|| assignments below); hook never aborts.
+_FIELDS_RAW="$(python3 - <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    import shlex
+except ImportError:
+    # shlex is stdlib; this branch is unreachable in practice
+    sys.exit(1)
+
+raw = os.environ.get('CAST_STOP_PARSED', '')
+try:
+    d = json.loads(raw)
+except Exception:
+    # Emit error sentinel so the shell guard below can exit early
+    print("CAST_FIELDS_ERROR=1")
+    sys.exit(0)
+
+if 'error' in d:
+    print("CAST_FIELDS_ERROR=1")
+    sys.exit(0)
+
+output_full   = d.get('output_full', '') or d.get('last_assistant_message', '') or ''
+response_text = d.get('response_text', '') or output_full
+
+fields = {
+    'AGENT_NAME':         d.get('agent_name', 'unknown') or 'unknown',
+    'SESSION_ID':         d.get('session_id', '') or '',
+    'STOP_REASON':        d.get('stop_reason', '') or '',
+    'HAS_TURN_CEILING':   '1' if d.get('has_turn_ceiling') else '0',
+    'AGENT_ID':           d.get('agent_id', '') or '',
+    'DURATION_MS':        str(d.get('duration_ms', 0) or 0),
+    'TOOL_USES':          str(d.get('tool_uses', 0) or 0),
+    'CACHE_READ_TOKENS':  str(d.get('cache_read_input_tokens') or ''),
+    'CACHE_CREATE_TOKENS': str(d.get('cache_creation_input_tokens') or ''),
+    'OUTPUT_FULL':        output_full,
+    'RESPONSE_TEXT':      response_text,
+    'CAST_FIELDS_ERROR':  '0',
+}
+
+for key, val in fields.items():
+    # shlex.quote is MANDATORY here — the eval below is safe ONLY because every
+    # emitted field is quoted. Removing shlex.quote would open a shell-injection
+    # path: arbitrary agent output flows into an evaluated string downstream.
+    # NOTE keep this comment free of apostrophes, backticks and dollar-paren:
+    # it sits inside a command-substitution-nested heredoc that bash 3.2
+    # mis-parses on the macOS CI runner.
+    print(key + '=' + shlex.quote(str(val)))
+PYEOF
+)" || true
+
+# Apply extracted fields; safe defaults apply if extraction failed or was empty.
+# Safety contract: shlex.quote() is applied to every field in the Python block
+# above — do NOT eval _FIELDS_RAW from any source that skips that quoting step.
+eval "${_FIELDS_RAW:-CAST_FIELDS_ERROR=1}" 2>/dev/null || true
+
+if [ "${CAST_FIELDS_ERROR:-1}" = "1" ]; then
+  exit 0
+fi
+
+# Apply defaults for any field that eval may have left unset
+AGENT_NAME="${AGENT_NAME:-unknown}"
+SESSION_ID="${SESSION_ID:-}"
+STOP_REASON="${STOP_REASON:-}"
+HAS_TURN_CEILING="${HAS_TURN_CEILING:-0}"
+AGENT_ID="${AGENT_ID:-}"
+DURATION_MS="${DURATION_MS:-0}"
+TOOL_USES="${TOOL_USES:-0}"
+CACHE_READ_TOKENS="${CACHE_READ_TOKENS:-}"
+CACHE_CREATE_TOKENS="${CACHE_CREATE_TOKENS:-}"
+OUTPUT_FULL="${OUTPUT_FULL:-}"
+RESPONSE_TEXT="${RESPONSE_TEXT:-}"
+
+# Shared Status-contract helper (single source of truth; inline fallback if absent)
+if [ -r "${HOME}/.claude/scripts/cast-status-contract.sh" ]; then
+  # shellcheck source=/dev/null
+  . "${HOME}/.claude/scripts/cast-status-contract.sh"
+fi
+if ! command -v cast_status_exempt_agent >/dev/null 2>&1; then
+  cast_status_exempt_agent() { case "${1:-}" in general-purpose|Explore|Plan|claude|statusline-setup|output-style-setup|unknown|"") return 0;; *workflow-subagent*) return 0;; *) return 1;; esac; }
+  cast_output_lacks_prose() { [ -z "$(printf '%s' "${1:-}" | tr -d '[:space:]')" ]; }
+fi
+
+# Detect agents that are exempt from the Status block contract.
+# These agents either emit StructuredOutput tool results instead of prose Status blocks,
+# or are Claude Code built-ins / unidentifiable agents that don't follow the CAST agent protocol.
+STATUS_CONTRACT_EXEMPT="0"
+if cast_status_exempt_agent "$AGENT_NAME"; then
+  STATUS_CONTRACT_EXEMPT="1"
+fi
 export CAST_STOP_AGENT_ID="$AGENT_ID"
 export CAST_STOP_DURATION_MS="$DURATION_MS"
 export CAST_STOP_TOOL_USES="$TOOL_USES"
 export CAST_STOP_CACHE_READ_TOKENS="$CACHE_READ_TOKENS"
 export CAST_STOP_CACHE_CREATE_TOKENS="$CACHE_CREATE_TOKENS"
-
-# Detect agents that are exempt from the Status block contract.
-# These agents either emit StructuredOutput tool results instead of prose Status blocks,
-# or are Claude Code built-ins that don't follow the CAST agent protocol.
-# EXEMPT: Claude Code built-in types (general-purpose, Explore, Plan, etc.) + workflow-subagents
-STATUS_CONTRACT_EXEMPT="0"
-case "$AGENT_NAME" in
-  # Claude Code built-in agent types — never emit CAST Status blocks
-  general-purpose|Explore|Plan|claude|statusline-setup|output-style-setup)
-    STATUS_CONTRACT_EXEMPT="1"
-    ;;
-  # Workflow-subagent substring match (for any name containing it)
-  *workflow-subagent*)
-    STATUS_CONTRACT_EXEMPT="1"
-    ;;
-esac
 
 # Determine event type: blocked if [TURN CEILING] or stop_reason indicates error
 EVENT_TYPE="task_completed"
@@ -247,10 +312,31 @@ if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DB_PATH" ] && [ -s "$DB_PATH" ];
     DB_STATUS="BLOCKED"
   fi
   export CAST_STOP_DB_STATUS="$DB_STATUS"
-  CAST_STOP_RESPONSE_TEXT="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('response_text','') or d.get('output_full',''))" 2>/dev/null || echo "")"
+  CAST_STOP_RESPONSE_TEXT="${RESPONSE_TEXT}"
   export CAST_STOP_RESPONSE_TEXT
+  # Resolve agent transcript path for cost computation.
+  # Prefer agent_transcript_path from payload; else glob by session_id + agent_id.
+  CAST_STOP_TRANSCRIPT_PATH=""
+  if [ -n "$AGENT_ID" ] && [ -n "$SESSION_ID" ]; then
+    # Try recursive glob: covers flat AND workflow-nested paths
+    # Flat:   ~/.claude/projects/*/<session_id>/subagents/agent-<agent_id>.jsonl
+    # Nested: ~/.claude/projects/*/<session_id>/subagents/workflows/wf_*/agent-<agent_id>.jsonl
+    CAST_STOP_TRANSCRIPT_PATH="$(python3 -c "
+import glob, os, sys
+agent_id = os.environ.get('CAST_STOP_AGENT_ID', '')
+session_id = os.environ.get('CAST_STOP_SESSION', '')
+if not agent_id or not session_id:
+    sys.exit(0)
+pattern = os.path.expanduser(f'~/.claude/projects/*/{session_id}/subagents/**/agent-{agent_id}.jsonl')
+matches = glob.glob(pattern, recursive=True)
+if matches:
+    print(max(matches, key=os.path.getmtime))
+" 2>/dev/null || echo "")"
+  fi
+  export CAST_STOP_TRANSCRIPT_PATH
+  export CAST_PRICING_PATH="${HOME}/.claude/config/model-pricing.json"
   python3 - <<'PYEOF' 2>>"$HOOK_ERROR_LOG" || true
-import sqlite3, os, sys
+import sqlite3, os, sys, json, glob
 sys.path.insert(0, os.environ.get('CAST_HOOK_DIR', os.path.expanduser('~/.claude/scripts')))
 try:
     from cast_db import log_hook_failure
@@ -262,7 +348,6 @@ agent = os.environ.get('CAST_STOP_AGENT', '')
 sess  = os.environ.get('CAST_STOP_SESSION', '')
 ts    = os.environ.get('CAST_STOP_TS_ISO', '')
 st    = os.environ.get('CAST_STOP_DB_STATUS', 'DONE')
-duration_ms   = int(os.environ.get('CAST_STOP_DURATION_MS', '0') or '0')
 tool_uses     = int(os.environ.get('CAST_STOP_TOOL_USES', '0') or '0')
 response_text = os.environ.get('CAST_STOP_RESPONSE_TEXT', '') or None
 cache_read    = os.environ.get('CAST_STOP_CACHE_READ_TOKENS', '') or None
@@ -274,6 +359,95 @@ if cache_create:
 
 if not agent or not db:
     raise SystemExit(0)
+
+# ── Cost computation from transcript ────────────────────────────────────────
+# Defensive: all errors yield NULL cost; hook never aborts.
+cost_usd = None
+input_tokens = None
+output_tokens = None
+transcript_model = None
+
+try:
+    transcript_path = os.environ.get('CAST_STOP_TRANSCRIPT_PATH', '').strip()
+    if transcript_path and os.path.isfile(transcript_path):
+        total_input = 0
+        total_output = 0
+        total_cache_read = 0
+        total_cache_create = 0
+        found_usage = False
+
+        with open(transcript_path, 'r', errors='replace') as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                except Exception:
+                    continue
+                msg = obj.get('message', {}) if isinstance(obj.get('message'), dict) else {}
+                usage = msg.get('usage') if isinstance(msg.get('usage'), dict) else obj.get('usage')
+                if not isinstance(usage, dict):
+                    continue
+                total_input += usage.get('input_tokens', 0) or 0
+                total_output += usage.get('output_tokens', 0) or 0
+                total_cache_read += usage.get('cache_read_input_tokens', 0) or 0
+                total_cache_create += usage.get('cache_creation_input_tokens', 0) or 0
+                found_usage = True
+                if not transcript_model and isinstance(msg.get('model'), str):
+                    transcript_model = msg['model']
+
+        if found_usage:
+            input_tokens = total_input
+            output_tokens = total_output
+            # Transcript is authoritative for ALL token types — overrides payload values.
+            # The SubagentStop payload's cache fields reflect only the last message, not
+            # the full subagent session. For multi-message agents cache tokens dominate cost
+            # and the payload would understate them by a large factor.
+            cache_read = total_cache_read
+            cache_create = total_cache_create
+
+            # Load pricing table
+            pricing_path = os.environ.get('CAST_PRICING_PATH', '')
+            pricing_path = os.path.expanduser(pricing_path) if pricing_path else ''
+            rate_in = 3.0
+            rate_out = 15.0
+            try:
+                if pricing_path and os.path.isfile(pricing_path):
+                    with open(pricing_path, 'r') as pf:
+                        pricing = json.load(pf)
+                    models = pricing.get('models', {})
+                    model_key = transcript_model or ''
+                    entry = models.get(model_key) or models.get('_default') or {}
+                    rate_in = entry.get('cost_per_million_input', 3.0)
+                    rate_out = entry.get('cost_per_million_output', 15.0)
+            except Exception as _pe:
+                if log_hook_failure:
+                    log_hook_failure('cast-subagent-stop-hook:pricing_load', -1, str(_pe), sess)
+
+            # Anthropic full cost formula (cache tokens dominate)
+            cr = cache_read or 0
+            cc = cache_create or 0
+            cost_usd = round(
+                (total_input * rate_in + total_output * rate_out + cc * rate_in * 1.25 + cr * rate_in * 0.1)
+                / 1_000_000,
+                6
+            )
+        else:
+            if log_hook_failure:
+                log_hook_failure('cast-subagent-stop-hook:cost_no_usage', 0,
+                                 f'no usage blocks found in transcript {transcript_path}', sess)
+    else:
+        if transcript_path:
+            # path was resolved but file doesn't exist — log it
+            if log_hook_failure:
+                log_hook_failure('cast-subagent-stop-hook:cost_no_transcript', 0,
+                                 f'transcript not found: {transcript_path}', sess)
+        # No transcript path at all — silent NULL (common for agents dispatched without agent_id)
+except Exception as _ce:
+    cost_usd = None
+    if log_hook_failure:
+        log_hook_failure('cast-subagent-stop-hook:cost_exception', -1, str(_ce), sess)
 
 # Add new telemetry columns if they don't exist (idempotent — migration 011)
 try:
@@ -295,6 +469,7 @@ except Exception:
 # Update the running row for this agent. Use agent_id for precise matching when
 # available; fall back to MIN(id) FIFO heuristic when agent_id is absent.
 # FIFO: oldest started row of this type is the one that just finished first.
+# cost_usd, input_tokens, output_tokens, model are written atomically in the same UPDATE.
 agent_id = os.environ.get('CAST_STOP_AGENT_ID', '')
 for attempt in range(3):
     try:
@@ -302,16 +477,29 @@ for attempt in range(3):
         cur  = conn.cursor()
         if agent_id:
             cur.execute(
-                "UPDATE agent_runs SET status=?, ended_at=?, duration_ms=?, tool_uses=?, response=?, cache_read_input_tokens=?, cache_creation_input_tokens=? "
-                "WHERE status='running' AND agent_id=?",
-                (st, ts, duration_ms, tool_uses, response_text, cache_read, cache_create, agent_id),
+                "UPDATE agent_runs SET status=?, ended_at=?, "
+                "duration_ms=CAST((julianday(replace(replace(?,'T',' '),'Z','')) - julianday(replace(replace(started_at,'T',' '),'Z',''))) * 86400000 AS INTEGER), "
+                "tool_uses=?, response=?, "
+                "cache_read_input_tokens=?, cache_creation_input_tokens=?, "
+                "cost_usd=?, input_tokens=?, output_tokens=?, model=? "
+                "WHERE id=("
+                "  SELECT MIN(id) FROM agent_runs WHERE status='running' AND agent_id=?"
+                ")",
+                (st, ts, ts, tool_uses, response_text, cache_read, cache_create,
+                 cost_usd, input_tokens, output_tokens, transcript_model, agent_id),
             )
         else:
             cur.execute(
-                "UPDATE agent_runs SET status=?, ended_at=?, duration_ms=?, tool_uses=?, response=?, cache_read_input_tokens=?, cache_creation_input_tokens=? "
-                "WHERE status='running' AND agent=? AND session_id=? "
-                "AND id=(SELECT MIN(id) FROM agent_runs WHERE status='running' AND agent=? AND session_id=?)",
-                (st, ts, duration_ms, tool_uses, response_text, cache_read, cache_create, agent, sess, agent, sess),
+                "UPDATE agent_runs SET status=?, ended_at=?, "
+                "duration_ms=CAST((julianday(replace(replace(?,'T',' '),'Z','')) - julianday(replace(replace(started_at,'T',' '),'Z',''))) * 86400000 AS INTEGER), "
+                "tool_uses=?, response=?, "
+                "cache_read_input_tokens=?, cache_creation_input_tokens=?, "
+                "cost_usd=?, input_tokens=?, output_tokens=?, model=? "
+                "WHERE id=("
+                "  SELECT MIN(id) FROM agent_runs WHERE status='running' AND agent=? AND session_id=?"
+                ")",
+                (st, ts, ts, tool_uses, response_text, cache_read, cache_create,
+                 cost_usd, input_tokens, output_tokens, transcript_model, agent, sess),
             )
         rows_affected = conn.execute("SELECT changes()").fetchone()[0]
         conn.commit()
@@ -377,13 +565,15 @@ if len(response_text.strip()) < 50:
 # agent='unknown' — no hook_failure needed for this expected gap.
 
 # Detection: prose Status block
+# Recognized values: standard four (DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT) plus
+# reviewer statuses (APPROVE|REQUEST_CHANGES) used by code-reviewer and pr-reviewer.
 has_status = bool(re.search(
-    r'[*_]{0,2}\s*Status:\s*[*_]{0,2}\s*(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT)',
+    r'[*_]{0,2}\s*Status:\s*[*_]{0,2}\s*(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT|APPROVE|REQUEST_CHANGES)',
     response_text,
 ))
 # Detection: JSON fenced status block
 has_json = bool(re.search(
-    r'```json\s+status[\s\S]*?"status"\s*:\s*"(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT)"',
+    r'```json\s+status[\s\S]*?"status"\s*:\s*"(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT|APPROVE|REQUEST_CHANGES)"',
     response_text, re.IGNORECASE,
 ))
 
@@ -435,17 +625,189 @@ except Exception as e:
 PYEOF
 fi
 
+# ── Step 2.4: Handoff block validation (WARN-only) ──────────────────────────
+# Validates the typed ## Handoff schema in chained agent responses and logs
+# violations to agent_protocol_violations for dashboard observability.
+#
+# False-positive guard (CRITICAL):
+#   Block ABSENT + batch_id present  → violation="missing_handoff"   (chained, expected block)
+#   Block ABSENT + batch_id absent   → log NOTHING                   (solo dispatch is fine)
+#   Block PRESENT but unparseable    → violation="invalid_handoff_format"
+#   Block PRESENT + bad schema       → violation="handoff_schema_violation", pattern=<field>
+#
+# Exemptions: agents in STATUS_CONTRACT_EXEMPT=1 are skipped entirely (same guard as
+# Steps 2.1 / 3.5). Always exits 0 — warn-only, never blocks the hook pipeline.
+if [[ "$STATUS_CONTRACT_EXEMPT" = "0" ]] && [[ -n "${CAST_STOP_RESPONSE_TEXT:-}" ]]; then
+  python3 - 2>>"$HOOK_ERROR_LOG" <<'PYEOF' || true
+import os, sys, re, json, importlib.util, subprocess
+from datetime import datetime, timezone
+
+# Resolved once here — used by all importlib.util loads and the redaction call below.
+_hook_dir = os.environ.get('CAST_HOOK_DIR', os.path.expanduser('~/.claude/scripts'))
+
+# ── Load cast_db for db_write ────────────────────────────────────────────────
+def _noop_db_write(table, payload):
+    return False
+
+db_write = _noop_db_write
+try:
+    _db_spec = importlib.util.spec_from_file_location(
+        'cast_db', os.path.join(_hook_dir, 'cast_db.py')
+    )
+    if _db_spec and _db_spec.loader:
+        _cast_db = importlib.util.module_from_spec(_db_spec)
+        _db_spec.loader.exec_module(_cast_db)
+        db_write = _cast_db.db_write
+except Exception:
+    pass  # fall back to no-op; must not crash the hook pipeline
+
+# ── Load cast_handoff_parser for validate_handoff ───────────────────────────
+validate_handoff = None
+try:
+    _hp_spec = importlib.util.spec_from_file_location(
+        'cast_handoff_parser', os.path.join(_hook_dir, 'cast_handoff_parser.py')
+    )
+    if _hp_spec and _hp_spec.loader:
+        _hp_mod = importlib.util.module_from_spec(_hp_spec)
+        _hp_spec.loader.exec_module(_hp_mod)
+        validate_handoff = _hp_mod.validate_handoff
+except Exception:
+    pass
+
+if validate_handoff is None:
+    # Minimal inline fallback so the hook degrades gracefully if the file is missing
+    _HANDOFF_RE = re.compile(r'## Handoff\s*\n([\s\S]+?)(?=\n## |\Z)')
+    def validate_handoff(text):
+        m = _HANDOFF_RE.search(text)
+        if not m:
+            return {'block_present': False, 'ok': False, 'violation': 'missing_handoff',
+                    'pattern': None, 'detail': 'No ## Handoff block found', 'raw_excerpt': ''}
+        block = m.group(1)
+        # Minimal: check parseable and required fields present
+        fields = {}
+        for line in block.splitlines():
+            line = line.strip()
+            if ':' in line:
+                k, _, v = line.partition(':')
+                fields[k.strip().lower()] = v.strip()
+        for req in ('files_changed', 'status', 'blockers'):
+            if req not in fields or not fields[req]:
+                return {'block_present': True, 'ok': False,
+                        'violation': 'handoff_schema_violation',
+                        'pattern': f'missing_field:{req}', 'detail': f'Missing {req}',
+                        'raw_excerpt': block[:500]}
+        if fields.get('status') not in ('DONE', 'DONE_WITH_CONCERNS', 'BLOCKED'):
+            return {'block_present': True, 'ok': False,
+                    'violation': 'handoff_schema_violation',
+                    'pattern': f'invalid_value:status={fields.get("status", "")}',
+                    'detail': 'Invalid status value', 'raw_excerpt': block[:500]}
+        return {'block_present': True, 'ok': True, 'violation': None,
+                'pattern': None, 'detail': None, 'raw_excerpt': block[:500]}
+
+# ── Read environment ─────────────────────────────────────────────────────────
+response_text = os.environ.get('CAST_STOP_RESPONSE_TEXT', '') or ''
+if not response_text.strip():
+    sys.exit(0)
+
+agent_type = os.environ.get('CAST_STOP_AGENT', 'unknown') or 'unknown'
+agent_id   = os.environ.get('CAST_STOP_AGENT_ID', '') or ''
+session_id = os.environ.get('CAST_STOP_SESSION', '') or ''
+
+# Detect whether this agent was chained: batch_id present in raw SubagentStop input
+# (same signal used by cast-agent-protocol-check.sh).
+batch_id = None
+raw_input = os.environ.get('CAST_STOP_INPUT', '') or ''
+if raw_input:
+    try:
+        batch_id = json.loads(raw_input).get('batch_id')
+    except Exception:
+        pass
+
+# ── Run validation ───────────────────────────────────────────────────────────
+try:
+    result = validate_handoff(response_text)
+except Exception:
+    sys.exit(0)  # parser error → degrade gracefully, no violation logged
+
+block_present = result.get('block_present', False)
+ok            = result.get('ok', True)
+violation     = result.get('violation')
+pattern       = result.get('pattern')
+detail        = result.get('detail', '')
+raw_excerpt   = result.get('raw_excerpt', '')
+
+# Solo dispatch with absent block: not an error — log nothing.
+# Only flag a missing block when the agent was part of a chain (batch_id set).
+if not block_present and not batch_id:
+    sys.exit(0)
+
+# No violation: all good — nothing to log.
+if ok:
+    sys.exit(0)
+
+# ── Redact raw_excerpt before storing (matches lines 1183-1191 in this hook) ──
+# Same mechanism as the summary/concerns redaction: pipe through cast-redact.py
+# --engine regex, extract redacted_text from JSON output. Falls back to the
+# original text on any subprocess/parse failure — hook pipeline never blocked.
+_excerpt_raw = (raw_excerpt or detail or '')[:500]
+_excerpt_for_db = _excerpt_raw
+try:
+    _redact_result = subprocess.run(
+        ['python3', os.path.join(_hook_dir, 'cast-redact.py'), '--engine', 'regex'],
+        input=_excerpt_raw.encode(),
+        capture_output=True,
+        timeout=5,
+    )
+    if _redact_result.returncode == 0:
+        _redacted = json.loads(_redact_result.stdout.decode())
+        _excerpt_for_db = _redacted.get('redacted_text', _excerpt_raw)
+except Exception:
+    pass  # fall back to unredacted on any subprocess or parse failure
+
+# ── Log violation ────────────────────────────────────────────────────────────
+now_iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+payload = {
+    'session_id': session_id,
+    'agent_type': agent_type,
+    'agent_id':   agent_id,
+    'batch_id':   batch_id,
+    'violation':  violation,
+    'pattern':    pattern,
+    'timestamp':  now_iso,
+    'raw_excerpt': _excerpt_for_db,
+}
+# Remove None values to avoid SQLite type coercion issues
+payload = {k: v for k, v in payload.items() if v is not None}
+
+try:
+    db_write('agent_protocol_violations', payload)
+except Exception:
+    pass  # never crash the hook pipeline
+
+# Stderr WARN — no hookSpecificOutput banner (WARN-only contract)
+print(
+    f'[CAST-WARN] handoff_validation: {agent_type} {violation}'
+    + (f' ({pattern})' if pattern else '')
+    + ' — logged to cast.db',
+    file=sys.stderr,
+)
+PYEOF
+fi
+
 # ── Step 2.5: Quality gate logging ──────────────────────────────────────────
 # When a gate agent (code-reviewer, test-runner, security) finishes, extract its
 # Status line and insert a row into quality_gates for dashboard observability.
-#   DONE                 → pass
+#   DONE                 → pass  (contract_passed=1)
+#   APPROVE              → pass  (contract_passed=1, reviewer alias for DONE)
 #   DONE_WITH_CONCERNS   → warn
+#   REQUEST_CHANGES      → warn  (reviewer alias for DONE_WITH_CONCERNS)
 #   BLOCKED              → block
 #   NEEDS_CONTEXT        → warn
 # Other agents are skipped.
 # Export the full agent output up-front — Step 3.5 (truncation detection)
 # exports it again below; this earlier export lets quality-gate logging read it.
-CAST_STOP_OUTPUT_FULL="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('output_full','') or d.get('last_assistant_message',''))" 2>/dev/null || echo "")"
+CAST_STOP_OUTPUT_FULL="${OUTPUT_FULL}"
 export CAST_STOP_OUTPUT_FULL
 
 if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DB_PATH" ] && [ -s "$DB_PATH" ]; then
@@ -468,19 +830,21 @@ if not agent or not db:
     raise SystemExit(0)
 
 # Extract Status line from full output (no tail window — avoids FP for long Work Logs)
-m = re.search(r'[*_]{0,2}\s*Status:\s*[*_]{0,2}\s*(DONE_WITH_CONCERNS|DONE|BLOCKED|NEEDS_CONTEXT)', out)
+# Recognized: standard four + reviewer statuses (APPROVE|REQUEST_CHANGES)
+m = re.search(r'[*_]{0,2}\s*Status:\s*[*_]{0,2}\s*(DONE_WITH_CONCERNS|DONE|BLOCKED|NEEDS_CONTEXT|APPROVE|REQUEST_CHANGES)', out)
 if not m:
     raise SystemExit(0)
 
 status = m.group(1)
-ts = datetime.datetime.utcnow().isoformat() + 'Z'
+ts = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
 
 try:
     conn = sqlite3.connect(db, timeout=5)
     conn.execute(
         'INSERT INTO quality_gates (id, session_id, agent_name, timestamp, status_line, contract_passed, retry_count) '
         'VALUES (?, ?, ?, ?, ?, ?, ?)',
-        (str(uuid.uuid4()), sess, agent, ts, status, 1 if status == 'DONE' else 0, 0),
+        # APPROVE is pass-like (reviewer's DONE equivalent); REQUEST_CHANGES is non-pass
+        (str(uuid.uuid4()), sess, agent, ts, status, 1 if status in ('DONE', 'APPROVE') else 0, 0),
     )
     conn.commit()
     conn.close()
@@ -664,31 +1028,70 @@ fi
 # ── Step 3.5: Truncation detection ───────────────────────────────────────────
 # A well-formed agent output ends with a Status: <VALUE> line.
 # If missing, the agent was truncated mid-execution.
-CAST_STOP_OUTPUT_FULL="$(python3 -c "import json,os; d=json.loads(os.environ.get('CAST_STOP_PARSED','{}')); print(d.get('output_full','') or d.get('last_assistant_message',''))" 2>/dev/null || echo "")"
-export CAST_STOP_OUTPUT_FULL
+# SKIP: agents exempt from the Status block contract (Claude Code built-ins, workflow-subagents)
+# — they legitimately emit StructuredOutput or other non-CAST completion patterns.
+if [[ "$STATUS_CONTRACT_EXEMPT" = "0" ]]; then
+  # OUTPUT_FULL already extracted by the consolidated field-extraction block above.
+  CAST_STOP_OUTPUT_FULL="${OUTPUT_FULL}"
+  export CAST_STOP_OUTPUT_FULL
 
-TRUNCATED="$(python3 - <<'PYEOF' 2>/dev/null
+  # Three-value truncation classifier:
+  #   0 = well-formed        (Status block present)
+  #   1 = missing_formality  (>=200 chars, clean ending, no Status block — e.g. push-agent "all done")
+  #   2 = actual_truncation  (structural signals: short, mid-word ending, trailing colon, odd code fence)
+  TRUNC_CLASS="$(python3 - <<'PYEOF' 2>/dev/null
 import re, os
 output = os.environ.get('CAST_STOP_OUTPUT_FULL', '')
-# Search full output — no tail window (avoids FP for long Work Logs)
-# Also accept markdown emphasis around Status verb and JSON status form
-has_status = bool(re.search(r'[*_]{0,2}\s*Status:\s*[*_]{0,2}\s*(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT)', output))
-has_json_status = bool(re.search(r'"status"\s*:\s*"(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT)"', output))
-print('0' if (has_status or has_json_status) else '1')
+# Well-formed: Status block present (full output search, avoids FP for long Work Logs)
+# Recognized values: standard four + reviewer statuses (APPROVE|REQUEST_CHANGES)
+has_status = bool(re.search(r'[*_]{0,2}\s*Status:\s*[*_]{0,2}\s*(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT|APPROVE|REQUEST_CHANGES)', output))
+has_json = bool(re.search(r'"status"\s*:\s*"(DONE|DONE_WITH_CONCERNS|BLOCKED|NEEDS_CONTEXT|APPROVE|REQUEST_CHANGES)"', output))
+if has_status or has_json:
+    print('0')
+    raise SystemExit(0)
+# Verdict-keyword exemption: deliberate short verdicts (e.g. "VERDICT: APPROVE",
+# "Status: DONE") are well-formed even when under 200 chars.
+# DONE_WITH_CONCERNS must be listed first in the alternation (longer match wins over bare DONE).
+has_verdict = bool(re.search(r'\b(DONE_WITH_CONCERNS|DONE|BLOCKED|NEEDS_CONTEXT|APPROVE|REQUEST_CHANGES)\b', output))
+if has_verdict:
+    print('0')
+    raise SystemExit(0)
+# No Status block — classify via structural truncation signals
+length = len(output)
+# Signal 1: short output (< 200 chars) — no room for a complete response
+if length < 200:
+    print('2')
+    raise SystemExit(0)
+tail = output[-100:]
+# Signal 2: trailing colon suggests an incomplete statement
+if re.search(r':\s*$', tail):
+    print('2')
+    raise SystemExit(0)
+# Signal 3: unclosed code fence (odd count of triple backticks)
+if output.count('```') % 2 != 0:
+    print('2')
+    raise SystemExit(0)
+# Signal 4: mid-word ending — no terminal punctuation or whitespace before EOF
+if not re.search(r'[.!?)\]}\s]\s*$', tail):
+    print('2')
+    raise SystemExit(0)
+# Clean ending, long enough, no structural truncation signals → MISSING FORMALITY only
+print('1')
 PYEOF
-)"
+  )"
 
-if [[ "${TRUNCATED:-0}" = "1" ]] \
-   && [[ -n "$CAST_STOP_OUTPUT_FULL" ]] \
-   && [[ -n "${CAST_STOP_AGENT:-}" ]] \
-   && [[ "${CAST_STOP_AGENT:-}" != "unknown" ]]; then
-  TRUNC_DIR="${HOME}/.claude/cast/truncated-agents"
-  mkdir -p "$TRUNC_DIR" 2>/dev/null || true
+  if [[ "${TRUNC_CLASS:-0}" = "2" ]] \
+     && [[ -n "$CAST_STOP_OUTPUT_FULL" ]] \
+     && [[ -n "${CAST_STOP_AGENT:-}" ]] \
+     && [[ "${CAST_STOP_AGENT:-}" != "unknown" ]]; then
+    # ACTUAL TRUNCATION: write file + fire banner
+    TRUNC_DIR="${HOME}/.claude/cast/truncated-agents"
+    mkdir -p "$TRUNC_DIR" 2>/dev/null || true
 
-  export CAST_TRUNC_DIR="$TRUNC_DIR"
-  export CAST_TRUNC_SAFE_AGENT="$SAFE_AGENT"
+    export CAST_TRUNC_DIR="$TRUNC_DIR"
+    export CAST_TRUNC_SAFE_AGENT="$SAFE_AGENT"
 
-  python3 - <<'PYEOF' 2>/dev/null || true
+    python3 - <<'PYEOF' 2>/dev/null || true
 import json, os
 trunc_dir = os.environ.get('CAST_TRUNC_DIR', '')
 agent_raw = os.environ.get('CAST_STOP_AGENT', 'unknown')
@@ -709,9 +1112,45 @@ with open(filepath, 'w') as f:
     json.dump(record, f, indent=2)
 PYEOF
 
-  # Emit directive to parent session — use SAFE_AGENT (not AGENT_NAME) to prevent JSON-breaking
-  # characters from hostile hook payloads (security hardening).
-  echo '{"hookSpecificOutput":{"hookEventName":"SubagentStop","additionalContext":"[CAST-TRUNCATED] Agent '"$SAFE_AGENT"' stopped without a valid Status block. Output may be incomplete. Re-dispatch the agent or review ~/.claude/cast/truncated-agents/ for the partial output. Do NOT auto-retry expensive agents — surface this as BLOCKED."}}'
+    # Emit directive to parent session — use SAFE_AGENT (not AGENT_NAME) to prevent JSON-breaking
+    # characters from hostile hook payloads (security hardening).
+    echo '{"hookSpecificOutput":{"hookEventName":"SubagentStop","additionalContext":"[CAST-TRUNCATED] Agent '"$SAFE_AGENT"' stopped without a valid Status block. Output may be incomplete. Re-dispatch the agent or review ~/.claude/cast/truncated-agents/ for the partial output. Do NOT auto-retry expensive agents — surface this as BLOCKED."}}'
+
+  elif [[ "${TRUNC_CLASS:-0}" = "1" ]] \
+       && [[ -n "$CAST_STOP_OUTPUT_FULL" ]] \
+       && [[ -n "${CAST_STOP_AGENT:-}" ]] \
+       && [[ "${CAST_STOP_AGENT:-}" != "unknown" ]]; then
+    # MISSING FORMALITY: suppress banner, log protocol violation (best-effort — never crash)
+    python3 - <<'PYEOF' 2>/dev/null || true
+import sqlite3, os
+db    = os.path.expanduser(os.environ.get('CAST_DB_PATH', '~/.claude/cast.db'))
+agent = os.environ.get('CAST_STOP_AGENT', 'unknown')
+sess  = os.environ.get('CAST_STOP_SESSION', '')
+ts    = os.environ.get('CAST_STOP_TS_ISO', '')
+out   = os.environ.get('CAST_STOP_OUTPUT_FULL', '')
+try:
+    # Table-existence guard: skip silently if DB absent or table not yet created
+    if not os.path.isfile(db):
+        raise SystemExit(0)
+    conn = sqlite3.connect(db, timeout=2)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'agent_protocol_violations' not in tables:
+        conn.close()
+        raise SystemExit(0)
+    conn.execute(
+        'INSERT INTO agent_protocol_violations '
+        '(session_id, agent_type, violation, pattern, timestamp, raw_excerpt) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (sess, agent, 'missing_formality', 'no_status_block', ts, out[-200:] if out else None),
+    )
+    conn.commit()
+    conn.close()
+except SystemExit:
+    pass
+except Exception:
+    pass  # benign: never crash the hook pipeline on a protocol-violation write
+PYEOF
+  fi
 fi
 
 # ── Step 4: Chain dispatch (pipeline automation) ──────────────────────────────
@@ -749,71 +1188,6 @@ if [[ -x "$(dirname "$0")/cast-subagent-worktree-check.sh" ]]; then
   bash "$(dirname "$0")/cast-subagent-worktree-check.sh" <<< "${INPUT:-}" 2>/dev/null || true
 fi
 
-# ── Step 5: Auto-resume detection (DISABLED — orchestrator agent retired 2026-04-16) ─
-# The orchestrator agent was retired in Task 2.1. Plan execution now runs via the
-# /orchestrate skill in the main session. This block will never fire because no
-# subagent named "orchestrator" is dispatched anymore. Kept for reference only.
-CKPT_LOG="${HOME}/.claude/cast/orchestrator-checkpoint.log"
-
-if echo "$AGENT_NAME" | grep -qiE "orchestrator"; then
-  if [ -f "$CKPT_LOG" ]; then
-    # Check the checkpoint does NOT end with [ORCHESTRATOR DONE]
-    if ! tail -1 "$CKPT_LOG" 2>/dev/null | grep -q '\[ORCHESTRATOR DONE\]'; then
-      # Only trigger on clean stops, not errors
-      if echo "$STOP_REASON" | grep -qiE "^(end_turn|max_turns)$"; then
-
-        LAST_BATCH="$(grep 'BATCH.*COMPLETE' "$CKPT_LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+')"
-        NEXT_BATCH="$((${LAST_BATCH:-0} + 1))"
-        PLAN_FILE="$(grep '^\[PLAN\]' "$CKPT_LOG" 2>/dev/null | tail -1 | sed 's/\[PLAN\] //')"
-
-        RESUME_DIR="${HOME}/.claude/cast/resume-queue"
-        mkdir -p "$RESUME_DIR" 2>/dev/null || true
-
-        TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))")"
-        OUT="${RESUME_DIR}/${TS}-orchestrator.json"
-
-        export CAST_RESUME_TS="$TS"
-        export CAST_RESUME_PLAN_FILE="${PLAN_FILE:-}"
-        export CAST_RESUME_NEXT_BATCH="$NEXT_BATCH"
-        export CAST_RESUME_CKPT="$CKPT_LOG"
-        export CAST_RESUME_OUT="$OUT"
-
-        python3 - <<'PYEOF' 2>/dev/null || true
-import json, os
-
-out  = os.environ.get('CAST_RESUME_OUT', '')
-if not out:
-    raise SystemExit(0)
-
-payload = {
-    "version":           1,
-    "timestamp":         os.environ.get('CAST_RESUME_TS', ''),
-    "plan_file":         os.environ.get('CAST_RESUME_PLAN_FILE') or None,
-    "resume_from_batch": int(os.environ.get('CAST_RESUME_NEXT_BATCH', '1')),
-    "checkpoint_log":    os.environ.get('CAST_RESUME_CKPT', ''),
-}
-with open(out, 'w') as f:
-    json.dump(payload, f, indent=2)
-PYEOF
-
-        # Notify user
-        NOTIFY_MSG="Orchestrator stopped mid-run after Batch ${LAST_BATCH:-0} — run /orchestrate to resume"
-        bash "${HOME}/.claude/scripts/cast-notify.sh" "blocked" "$NOTIFY_MSG" 2>/dev/null || true
-
-        # Emit task_blocked event
-        if [ -f "${HOME}/.claude/scripts/cast-events.sh" ]; then
-          # shellcheck source=/dev/null
-          source "${HOME}/.claude/scripts/cast-events.sh" 2>/dev/null || true
-          cast_emit_event 'task_blocked' 'orchestrator' 'session' '' \
-            "Orchestrator stopped at batch ${LAST_BATCH:-0} without DONE sentinel" \
-            'BLOCKED' 2>/dev/null || true
-        fi
-
-      fi
-    fi
-  fi
-fi
-
 # ── Emit compressed hookSpecificOutput ───────────────────────────────────────
 # Only emit when there is response text to parse. Excludes full response body
 # from the payload — contains only: status, summary, concerns.
@@ -844,8 +1218,10 @@ print(json.dumps(concerns))
   # Redact PII (e.g. API keys, emails) from summary and concerns before serialization.
   # HOOK_DIR is exported at script top — points to the directory containing cast-redact.py.
   # Fallback: if cast-redact.py is unavailable, use raw values (|| passthrough is intentional).
-  SUMMARY_REDACTED="$(echo "${CAST_STOP_SUMMARY}" | python3 "${HOOK_DIR}/cast-redact.py" 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("redacted_text",""))' 2>/dev/null || echo "${CAST_STOP_SUMMARY}")"
-  CONCERNS_REDACTED="$(echo "${CAST_STOP_CONCERNS}" | python3 "${HOOK_DIR}/cast-redact.py" 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("redacted_text",""))' 2>/dev/null || echo "${CAST_STOP_CONCERNS}")"
+  # --engine regex: regex covers all credential/secret patterns; spaCy NER (person/org) is
+  # lower-stakes for a DB summary field — avoids 0.5–3s Presidio startup cost on this hot path.
+  SUMMARY_REDACTED="$(echo "${CAST_STOP_SUMMARY}" | python3 "${HOOK_DIR}/cast-redact.py" --engine regex 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("redacted_text",""))' 2>/dev/null || echo "${CAST_STOP_SUMMARY}")"
+  CONCERNS_REDACTED="$(echo "${CAST_STOP_CONCERNS}" | python3 "${HOOK_DIR}/cast-redact.py" --engine regex 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("redacted_text",""))' 2>/dev/null || echo "${CAST_STOP_CONCERNS}")"
   export CAST_STOP_SUMMARY_REDACTED="$SUMMARY_REDACTED"
   export CAST_STOP_CONCERNS_REDACTED="$CONCERNS_REDACTED"
 

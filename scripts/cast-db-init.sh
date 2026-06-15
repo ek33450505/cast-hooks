@@ -7,6 +7,12 @@
 # Idempotent: uses CREATE TABLE IF NOT EXISTS; safe to run repeatedly.
 # Schema versioning via PRAGMA user_version (current = 8).
 #
+# SINGLE SOURCE OF TRUTH: this script (its fresh-install CREATEs plus the
+# unconditional self-healing block at the bottom) is the authoritative definition
+# of the cast.db schema. The migration runner (cast-migrate.py)
+# is secondary and does not run reliably at install time, so any table or column a
+# writer depends on MUST be provisioned here — not only in a migration file.
+#
 # KNOWN ORGANIC SCHEMA ADDITIONS (live DB may contain unprovisionable tables):
 # These exist in deployed instances but are added by external systems or
 # sessions outside this init script, and should NOT be included here:
@@ -41,7 +47,8 @@ fi
 
 CURRENT_VERSION="$(sqlite3 "$DB_PATH" 'PRAGMA user_version;' 2>/dev/null || echo 0)"
 
-# If already at v8+, ensure all additive tables exist and exit
+# If already at v8+, ensure version-specific additive tables exist, then FALL THROUGH
+# to the unconditional self-healing block at the bottom (do NOT exit here).
 if [ "$CURRENT_VERSION" -ge 8 ]; then
   # Additive migration: create stream_events if missing (stream_hook_events retired via migration 015)
   # Also add cache token columns if missing (Task 0a: token optimization)
@@ -110,7 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_swarm_sessions_team ON swarm_sessions(team_name);
 -- Indexes added 2026-04-16 audit remediation
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
-CREATE INDEX IF NOT EXISTS idx_agent_runs_project ON agent_runs(project);
+-- idx_agent_runs_project removed (agent_runs.project dropped in migration 022 wave-3)
 CREATE INDEX IF NOT EXISTS idx_routing_events_event_type ON routing_events(event_type);
 
 CREATE TABLE IF NOT EXISTS tool_call_failures (
@@ -122,9 +129,16 @@ CREATE TABLE IF NOT EXISTS tool_call_failures (
     project    TEXT,
     data       TEXT
 );
+
 STREAM_TABLES
-  echo "cast.db already initialized (v${CURRENT_VERSION}), all tables ensured" >&2
-  exit 0
+  # Phase 3 #1 fix: do NOT exit here. Falling through lets the unconditional
+  # self-healing block (bottom of file) provision agent_truncations / injection_log /
+  # quality_gates / dispatch_decisions / task_queue on EXISTING v8 DBs. The early
+  # `exit 0` that used to be here made that block unreachable, so consolidated tables
+  # were never created on any v8 DB (only on fresh installs, which fall through). The
+  # version-gated migration blocks below are guarded by exact-version checks
+  # (==7, ==6, <7) and will not fire for a v8 DB; every statement is idempotent.
+  echo "cast.db already at v${CURRENT_VERSION}; ensuring additive + self-healing tables" >&2
 fi
 
 # Migrate v7 → v8: add swarm tables (additive only — no drops)
@@ -192,7 +206,7 @@ CREATE INDEX IF NOT EXISTS idx_swarm_sessions_team ON swarm_sessions(team_name);
 -- Indexes added 2026-04-16 audit remediation
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
-CREATE INDEX IF NOT EXISTS idx_agent_runs_project ON agent_runs(project);
+-- idx_agent_runs_project removed (agent_runs.project dropped in migration 022 wave-3)
 CREATE INDEX IF NOT EXISTS idx_routing_events_event_type ON routing_events(event_type);
 
 -- Tool call failures: PostToolUseFailure hook events (separate from routing_events)
@@ -212,7 +226,7 @@ MIGRATE_V8
   CURRENT_VERSION=8
 fi
 
-# Migrate v6 → v7: drop empty tables, add batch_id to agent_runs
+# Migrate v6 → v7: drop empty tables
 if [ "$CURRENT_VERSION" -eq 6 ]; then
   sqlite3 "$DB_PATH" <<'MIGRATE_V7'
 DROP TABLE IF EXISTS task_queue;
@@ -220,11 +234,6 @@ DROP TABLE IF EXISTS budgets;
 DROP TABLE IF EXISTS mismatch_signals;
 DROP TABLE IF EXISTS quality_gates;
 DROP TABLE IF EXISTS dispatch_decisions;
-
--- Add batch_id column if missing
-ALTER TABLE agent_runs ADD COLUMN batch_id INTEGER;
--- Note: model_used column dropped via migration 014 (audit 2026-05-16 #3)
-CREATE INDEX IF NOT EXISTS idx_agent_runs_batch_id ON agent_runs(batch_id);
 
 -- Drop stale indexes
 DROP INDEX IF EXISTS idx_task_queue_status;
@@ -242,7 +251,7 @@ DROP INDEX IF EXISTS idx_dispatch_decisions_created_at;
 
 PRAGMA user_version = 7;
 MIGRATE_V7
-  echo "cast.db migrated v6 → v7 (dropped 5 empty tables, added batch_id)" >&2
+  echo "cast.db migrated v6 → v7 (dropped 5 empty tables)" >&2
   CURRENT_VERSION=7
 fi
 
@@ -253,12 +262,13 @@ PRAGMA foreign_keys = ON;
 
 -- Sessions: one row per Claude Code session
 CREATE TABLE IF NOT EXISTS sessions (
-  id                    TEXT PRIMARY KEY,
+  id                    TEXT PRIMARY KEY NOT NULL,
   project               TEXT,
   project_root          TEXT,
   started_at            TEXT,
   ended_at              TEXT,
-  model                 TEXT
+  status                TEXT,
+  deleted_at            TEXT
 );
 
 -- Agent runs: one row per agent invocation
@@ -269,17 +279,17 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   model           TEXT,
   started_at      TEXT,
   ended_at        TEXT,
-  status          TEXT CHECK (status IN ('DONE','DONE_WITH_CONCERNS','BLOCKED','NEEDS_CONTEXT','running','failed')),
+  status          TEXT,  -- no CHECK: agent_runs is observability; the status contract is enforced by hooks/agents, not the DB (Phase 3). Writers also record 'abandoned','fallback','unknown'.
   input_tokens    INTEGER,
   output_tokens   INTEGER,
   cost_usd        REAL,
-  task_summary    TEXT,
-  project         TEXT,
   agent_id        TEXT,
-  batch_id        INTEGER,
   response        TEXT,
   cache_read_input_tokens INTEGER,
-  cache_creation_input_tokens INTEGER
+  cache_creation_input_tokens INTEGER,
+  owns_files      TEXT,
+  duration_ms     INTEGER,
+  tool_uses       INTEGER
 );
 
 -- Routing events: structured event log
@@ -290,7 +300,6 @@ CREATE TABLE IF NOT EXISTS routing_events (
   prompt_preview  TEXT,
   action          TEXT,
   matched_route   TEXT,
-  match_type      TEXT,
   pattern         TEXT,
   confidence      TEXT,
   project         TEXT,
@@ -314,8 +323,6 @@ CREATE TABLE IF NOT EXISTS agent_memories (
   decay_rate  REAL DEFAULT 0.0,
   valid_from  TEXT,
   valid_to    TEXT,
-  superseded_by INTEGER,
-  source_type TEXT,
   embedding BLOB,
   last_validated_at TEXT,
   retrieval_count INTEGER DEFAULT 0
@@ -325,7 +332,6 @@ CREATE TABLE IF NOT EXISTS agent_memories (
 CREATE INDEX IF NOT EXISTS idx_agent_runs_session       ON agent_runs(session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent         ON agent_runs(agent);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_status        ON agent_runs(status);
-CREATE INDEX IF NOT EXISTS idx_agent_runs_batch_id      ON agent_runs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_id      ON agent_runs(agent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_ended_at      ON agent_runs(ended_at);
 CREATE INDEX IF NOT EXISTS idx_routing_events_session   ON routing_events(session_id);
@@ -336,7 +342,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_memories_agent     ON agent_memories(agent)
 -- Indexes added 2026-04-16 audit remediation
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
-CREATE INDEX IF NOT EXISTS idx_agent_runs_project ON agent_runs(project);
+-- idx_agent_runs_project removed (agent_runs.project dropped in migration 022 wave-3)
 CREATE INDEX IF NOT EXISTS idx_routing_events_event_type ON routing_events(event_type);
 
 -- Stream events: stream-JSON observability pipeline (v4.6)
@@ -432,12 +438,6 @@ if ! sqlite3 "$DB_PATH" "PRAGMA table_info(agent_runs);" 2>/dev/null | grep -q "
   _columns_added=1
 fi
 
-# Check if batch_id column exists
-if ! sqlite3 "$DB_PATH" "PRAGMA table_info(agent_runs);" 2>/dev/null | grep -q "^[0-9].*batch_id"; then
-  sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN batch_id INTEGER;" 2>/dev/null || true
-  _columns_added=1
-fi
-
 # model_used column was dropped via migration 014 (audit 2026-05-16 #3)
 # Check if response column exists (migration 011 — agent response capture)
 if ! sqlite3 "$DB_PATH" "PRAGMA table_info(agent_runs);" 2>/dev/null | grep -q "^[0-9].*	response	"; then
@@ -468,13 +468,6 @@ AGENT_TRUNCATIONS_TABLE
   _columns_added=1
 fi
 
-# Ensure batch_id and agent_id indexes exist
-sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_agent_runs_batch_id ON agent_runs(batch_id);" 2>/dev/null || true
-sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_id ON agent_runs(agent_id);" 2>/dev/null || true
-
-# ── Phase 3+: provision tables that have live writers but were missing from earlier
-# versions of this script. All blocks are guarded by .tables checks — idempotent. ──
-
 # injection_log: memory retrieval telemetry (writer: cast-memory-router.py)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "injection_log"; then
   sqlite3 "$DB_PATH" <<'INJECTION_LOG_TABLE'
@@ -493,13 +486,12 @@ INJECTION_LOG_TABLE
   _columns_added=1
 fi
 
-# quality_gates: per-agent contract compliance (writers: cast-subagent-stop-hook.sh)
+# quality_gates: per-agent contract compliance (writers: cast-subagent-stop-hook.sh, write-guards.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "quality_gates"; then
   sqlite3 "$DB_PATH" <<'QUALITY_GATES_TABLE'
 CREATE TABLE IF NOT EXISTS quality_gates (
   id              TEXT PRIMARY KEY,
   session_id      TEXT,
-  batch_id        INTEGER,
   agent_name      TEXT,
   timestamp       TEXT,
   status_line     TEXT,
@@ -515,7 +507,7 @@ QUALITY_GATES_TABLE
   _columns_added=1
 fi
 
-# dispatch_decisions: routing telemetry
+# dispatch_decisions: routing telemetry (writer: cast-session-end.sh, cast-subagent-stop-hook.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "dispatch_decisions"; then
   sqlite3 "$DB_PATH" <<'DISPATCH_DECISIONS_TABLE'
 CREATE TABLE IF NOT EXISTS dispatch_decisions (
@@ -537,7 +529,7 @@ DISPATCH_DECISIONS_TABLE
   _columns_added=1
 fi
 
-# task_queue: persistent agent task queue
+# task_queue: persistent agent task queue (writers: cast-queue-add.sh, cast-task-created-hook.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "task_queue"; then
   sqlite3 "$DB_PATH" <<'TASK_QUEUE_TABLE'
 CREATE TABLE IF NOT EXISTS task_queue (
@@ -560,6 +552,30 @@ CREATE INDEX IF NOT EXISTS idx_task_queue_created_at ON task_queue(created_at);
 TASK_QUEUE_TABLE
   _columns_added=1
 fi
+
+# ── Phase 3: additive columns on core tables (idempotent; duplicate-column errors suppressed) ──
+# agent_runs.owns_files — agent file-scope tracking (reader: cast-post-tool.py). Was provisioned
+# only by the orphaned scripts/migrations/009, which never runs in the runtime.
+sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN owns_files TEXT;" 2>/dev/null || true
+
+# agent_runs.duration_ms + tool_uses — written by cast-subagent-stop-hook.sh's self-heal block and
+# read by cast-duration-check.sh. Were not in the fresh-install CREATE TABLE prior to v7.4.0.
+sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN duration_ms INTEGER;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN tool_uses INTEGER;" 2>/dev/null || true
+
+# dispatch_decisions.outcome — written by cast_db.py ensure_schema_columns(). Was not in the
+# fresh-install CREATE TABLE prior to v7.4.0. Must match default used by cast_db.py ('pending').
+sqlite3 "$DB_PATH" "ALTER TABLE dispatch_decisions ADD COLUMN outcome TEXT DEFAULT 'pending';" 2>/dev/null || true
+
+# sessions cost-rollup + lifecycle columns (writers: cast-session-end.sh, cast-maintenance.sh,
+# cast-budget-alert.sh, cast-cache-metrics.sh). Their UPDATEs failed on fresh installs without these.
+sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN status TEXT;" 2>/dev/null || true
+sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN deleted_at TEXT;" 2>/dev/null || true
+# total_input_tokens / total_output_tokens / total_cost_usd dropped in migration 022 (wave-3)
+# routing_events agent_id / agent_type dropped in migration 022 (wave-3)
+
+# ── Phase 3: provision tables that have live writers but were only created by the now-defunct
+# migration runners. cast-db-init.sh is the single source of truth (migrations don't run at install). ──
 
 # routines: scheduled-agent definitions (writer: cast-db-routines.py)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "routines"; then
@@ -584,7 +600,7 @@ ROUTINES_TABLE
   _columns_added=1
 fi
 
-# incidents: incident log
+# incidents: incident log (writers: cast-incident-record.sh, cast-incidents-backfill.py)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "incidents"; then
   sqlite3 "$DB_PATH" <<'INCIDENTS_TABLE'
 CREATE TABLE IF NOT EXISTS incidents (
@@ -602,7 +618,7 @@ INCIDENTS_TABLE
   _columns_added=1
 fi
 
-# plan_sessions: links an orchestrate session to its plan file
+# plan_sessions: links an orchestrate session to its plan file (writer: orchestrate skill)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "plan_sessions"; then
   sqlite3 "$DB_PATH" <<'PLAN_SESSIONS_TABLE'
 CREATE TABLE IF NOT EXISTS plan_sessions (
@@ -616,7 +632,7 @@ PLAN_SESSIONS_TABLE
   _columns_added=1
 fi
 
-# memory_consolidation_runs: consolidation telemetry
+# memory_consolidation_runs: "dream" consolidation telemetry (writers: cast-memory-dream*.py)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "memory_consolidation_runs"; then
   sqlite3 "$DB_PATH" <<'MEM_CONSOLIDATION_TABLE'
 CREATE TABLE IF NOT EXISTS memory_consolidation_runs (
@@ -640,7 +656,8 @@ MEM_CONSOLIDATION_TABLE
   _columns_added=1
 fi
 
-# archived_memories: low-importance memories moved out of agent_memories
+# archived_memories: low-importance memories moved out of agent_memories (writer: cast-memory-consolidate.py).
+# Mirrors agent_memories columns + archived_at; the writer copies whatever columns intersect.
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "archived_memories"; then
   sqlite3 "$DB_PATH" <<'ARCHIVED_MEMORIES_TABLE'
 CREATE TABLE IF NOT EXISTS archived_memories (
@@ -658,8 +675,6 @@ CREATE TABLE IF NOT EXISTS archived_memories (
   decay_rate  REAL,
   valid_from  TEXT,
   valid_to    TEXT,
-  superseded_by INTEGER,
-  source_type TEXT,
   embedding   BLOB,
   last_validated_at TEXT,
   retrieval_count INTEGER,
@@ -670,7 +685,8 @@ ARCHIVED_MEMORIES_TABLE
   _columns_added=1
 fi
 
-# budgets: per-scope cost limits
+# budgets: per-scope cost limits (reader: cast-budget-alert.sh; writer: `cast budget set`).
+# Was DROPPED in the v6→v7 migration and never re-provisioned.
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "budgets"; then
   sqlite3 "$DB_PATH" <<'BUDGETS_TABLE'
 CREATE TABLE IF NOT EXISTS budgets (
@@ -687,7 +703,8 @@ BUDGETS_TABLE
   _columns_added=1
 fi
 
-# agent_protocol_violations: protocol-violation tracking
+# agent_protocol_violations: protocol-violation tracking (writer: cast-agent-protocol-check.sh)
+# PRIORITY: its writer uses db_write with NO inline CREATE guard → silent write failures without this.
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "agent_protocol_violations"; then
   sqlite3 "$DB_PATH" <<'AGENT_PROTOCOL_VIOLATIONS_TABLE'
 CREATE TABLE IF NOT EXISTS agent_protocol_violations (
@@ -701,6 +718,7 @@ CREATE TABLE IF NOT EXISTS agent_protocol_violations (
   timestamp    TEXT NOT NULL,
   raw_excerpt  TEXT
 );
+
 CREATE INDEX IF NOT EXISTS idx_apv_session ON agent_protocol_violations(session_id);
 CREATE INDEX IF NOT EXISTS idx_apv_agent_type ON agent_protocol_violations(agent_type);
 CREATE INDEX IF NOT EXISTS idx_apv_timestamp ON agent_protocol_violations(timestamp);
@@ -721,6 +739,7 @@ CREATE TABLE IF NOT EXISTS file_writes (
   ts          TEXT NOT NULL DEFAULT (datetime('now')),
   line_range  TEXT
 );
+
 CREATE INDEX IF NOT EXISTS idx_file_writes_path        ON file_writes(file_path);
 CREATE INDEX IF NOT EXISTS idx_file_writes_session_ts  ON file_writes(session_id, ts);
 CREATE INDEX IF NOT EXISTS idx_file_writes_run         ON file_writes(run_id);
@@ -728,7 +747,7 @@ FILE_WRITES_TABLE
   _columns_added=1
 fi
 
-# unstaged_warnings: git staging enforcement
+# unstaged_warnings: git staging enforcement (writer: cast-post-tool.py at ~338)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "unstaged_warnings"; then
   sqlite3 "$DB_PATH" <<'UNSTAGED_WARNINGS_TABLE'
 CREATE TABLE IF NOT EXISTS unstaged_warnings (
@@ -739,13 +758,14 @@ CREATE TABLE IF NOT EXISTS unstaged_warnings (
   in_scope_files  TEXT,
   timestamp       TEXT NOT NULL
 );
+
 CREATE INDEX IF NOT EXISTS idx_uw_session ON unstaged_warnings(session_id);
 CREATE INDEX IF NOT EXISTS idx_uw_timestamp ON unstaged_warnings(timestamp);
 UNSTAGED_WARNINGS_TABLE
   _columns_added=1
 fi
 
-# managed_agent_invocations: Managed Agents telemetry
+# managed_agent_invocations: Managed Agents telemetry (writer: cast-managed-agent.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "managed_agent_invocations"; then
   sqlite3 "$DB_PATH" <<'MANAGED_AGENT_INVOCATIONS_TABLE'
 CREATE TABLE IF NOT EXISTS managed_agent_invocations (
@@ -761,21 +781,7 @@ MANAGED_AGENT_INVOCATIONS_TABLE
   _columns_added=1
 fi
 
-# contract_test_runs: agent contract testing
-if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "contract_test_runs"; then
-  sqlite3 "$DB_PATH" <<'CONTRACT_TEST_RUNS_TABLE'
-CREATE TABLE IF NOT EXISTS contract_test_runs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  agent TEXT,
-  fixture TEXT,
-  result TEXT,
-  timestamp TEXT
-);
-CONTRACT_TEST_RUNS_TABLE
-  _columns_added=1
-fi
-
-# dispatch_events: cookbook drift dispatch telemetry
+# dispatch_events: cookbook drift dispatch telemetry (writer: cast-cookbook-drift.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "dispatch_events"; then
   sqlite3 "$DB_PATH" <<'DISPATCH_EVENTS_TABLE'
 CREATE TABLE IF NOT EXISTS dispatch_events (
@@ -790,7 +796,7 @@ DISPATCH_EVENTS_TABLE
   _columns_added=1
 fi
 
-# rate_limit_snapshots: Anthropic rate limit tracking
+# rate_limit_snapshots: Anthropic rate limit tracking (writer: cast-rate-check.py)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "rate_limit_snapshots"; then
   sqlite3 "$DB_PATH" <<'RATE_LIMIT_SNAPSHOTS_TABLE'
 CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
@@ -805,37 +811,7 @@ RATE_LIMIT_SNAPSHOTS_TABLE
   _columns_added=1
 fi
 
-# files_api_events: file API observability
-if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "files_api_events"; then
-  sqlite3 "$DB_PATH" <<'FILES_API_EVENTS_TABLE'
-CREATE TABLE IF NOT EXISTS files_api_events (
-  id TEXT PRIMARY KEY,
-  action TEXT,
-  file_id TEXT,
-  local_path TEXT,
-  agent TEXT,
-  created_at TEXT
-);
-FILES_API_EVENTS_TABLE
-  _columns_added=1
-fi
-
-# batch_dispatches: batch API invocation tracking
-if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "batch_dispatches"; then
-  sqlite3 "$DB_PATH" <<'BATCH_DISPATCHES_TABLE'
-CREATE TABLE IF NOT EXISTS batch_dispatches (
-  id TEXT PRIMARY KEY,
-  batch_id TEXT NOT NULL,
-  agent TEXT NOT NULL,
-  custom_id TEXT NOT NULL,
-  prompt_preview TEXT,
-  submitted_at TEXT NOT NULL
-);
-BATCH_DISPATCHES_TABLE
-  _columns_added=1
-fi
-
-# agent_hallucinations: claim verification telemetry
+# agent_hallucinations: claim verification telemetry (writer: cast-hallucination-guard.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "agent_hallucinations"; then
   sqlite3 "$DB_PATH" <<'AGENT_HALLUCINATIONS_TABLE'
 CREATE TABLE IF NOT EXISTS agent_hallucinations (
@@ -852,7 +828,7 @@ AGENT_HALLUCINATIONS_TABLE
   _columns_added=1
 fi
 
-# code_ref_checks: code reference verification
+# code_ref_checks: code reference verification (writer: cast-code-ref-check.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "code_ref_checks"; then
   sqlite3 "$DB_PATH" <<'CODE_REF_CHECKS_TABLE'
 CREATE TABLE IF NOT EXISTS code_ref_checks (
@@ -869,7 +845,7 @@ CODE_REF_CHECKS_TABLE
   _columns_added=1
 fi
 
-# compaction_events: context compaction telemetry
+# compaction_events: context compaction telemetry (writer: cast-post-compact-hook.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "compaction_events"; then
   sqlite3 "$DB_PATH" <<'COMPACTION_EVENTS_TABLE'
 CREATE TABLE IF NOT EXISTS compaction_events (
@@ -884,7 +860,7 @@ COMPACTION_EVENTS_TABLE
   _columns_added=1
 fi
 
-# completeness_events: agent completeness tracking
+# completeness_events: agent completeness tracking (writer: cast-completeness-check.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "completeness_events"; then
   sqlite3 "$DB_PATH" <<'COMPLETENESS_EVENTS_TABLE'
 CREATE TABLE IF NOT EXISTS completeness_events (
@@ -899,7 +875,7 @@ COMPLETENESS_EVENTS_TABLE
   _columns_added=1
 fi
 
-# hook_failures: hook execution failure log
+# hook_failures: hook execution failure log (writer: cast-hook-monitor.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "hook_failures"; then
   sqlite3 "$DB_PATH" <<'HOOK_FAILURES_TABLE'
 CREATE TABLE IF NOT EXISTS hook_failures (
@@ -914,7 +890,7 @@ HOOK_FAILURES_TABLE
   _columns_added=1
 fi
 
-# pane_bindings: terminal pane session mapping
+# pane_bindings: terminal pane session mapping (writer: cast-pane-tracker.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "pane_bindings"; then
   sqlite3 "$DB_PATH" <<'PANE_BINDINGS_TABLE'
 CREATE TABLE IF NOT EXISTS pane_bindings (
@@ -928,7 +904,7 @@ PANE_BINDINGS_TABLE
   _columns_added=1
 fi
 
-# stop_failure_events: StopFailure hook telemetry
+# stop_failure_events: StopFailure hook telemetry (writer: cast-stop-failure-hook.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "stop_failure_events"; then
   sqlite3 "$DB_PATH" <<'STOP_FAILURE_EVENTS_TABLE'
 CREATE TABLE IF NOT EXISTS stop_failure_events (
@@ -945,7 +921,7 @@ STOP_FAILURE_EVENTS_TABLE
   _columns_added=1
 fi
 
-# worktree_anomalies: agent worktree isolation anomalies
+# worktree_anomalies: agent worktree isolation anomalies (writer: cast-subagent-worktree-check.sh)
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "worktree_anomalies"; then
   sqlite3 "$DB_PATH" <<'WORKTREE_ANOMALIES_TABLE'
 CREATE TABLE IF NOT EXISTS worktree_anomalies (
@@ -961,7 +937,9 @@ WORKTREE_ANOMALIES_TABLE
   _columns_added=1
 fi
 
-# schema_migrations: migration ledger
+# schema_migrations: the migration ledger. Canonical shape — cast-migrate.py is the
+# single runner. Provisioned here so it always exists even though the migration
+# runners are now redundant (init provisions all schema directly — see header).
 if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "schema_migrations"; then
   sqlite3 "$DB_PATH" <<'SCHEMA_MIGRATIONS_TABLE'
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -973,21 +951,45 @@ SCHEMA_MIGRATIONS_TABLE
   _columns_added=1
 fi
 
-# Additive columns on core tables (idempotent; duplicate-column errors suppressed)
-sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN owns_files TEXT;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN duration_ms INTEGER;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE agent_runs ADD COLUMN tool_uses INTEGER;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE dispatch_decisions ADD COLUMN outcome TEXT DEFAULT 'pending';" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN status TEXT;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN deleted_at TEXT;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN total_input_tokens INTEGER;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN total_output_tokens INTEGER;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN total_cost_usd REAL;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE routing_events ADD COLUMN agent_id TEXT;" 2>/dev/null || true
-sqlite3 "$DB_PATH" "ALTER TABLE routing_events ADD COLUMN agent_type TEXT;" 2>/dev/null || true
-
-if [ "$_columns_added" -eq 1 ]; then
-  echo "[cast-db-init] self-healed: added missing agent_id, batch_id, and/or response columns to agent_runs" >&2
+# eval_runs: A3 eval harness pass@k result storage (writer: scripts/cast-eval-runner.py).
+# One row per attempt per eval case. grader_results stores JSON array of per-grader outcomes.
+# pass_at_k is only set on the final attempt of a k-run batch.
+if ! sqlite3 "$DB_PATH" ".tables" 2>/dev/null | grep -q "eval_runs"; then
+  sqlite3 "$DB_PATH" <<'EVAL_RUNS_TABLE'
+CREATE TABLE IF NOT EXISTS eval_runs (
+  id             TEXT PRIMARY KEY,
+  eval_id        TEXT NOT NULL,
+  agent          TEXT NOT NULL,
+  attempt        INTEGER NOT NULL,
+  agent_run_id   TEXT,
+  status         TEXT NOT NULL,
+  grader_results TEXT,
+  pass_at_k      REAL,
+  k              INTEGER,
+  duration_ms    INTEGER,
+  started_at     TEXT,
+  ended_at       TEXT,
+  model          TEXT,
+  cost_tier      TEXT
+);
+EVAL_RUNS_TABLE
+  _columns_added=1
 fi
 
-echo "cast.db initialized (v8, WAL mode, 38 tables)" >&2
+# Ensure agent_id index exists
+sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_id ON agent_runs(agent_id);" 2>/dev/null || true
+
+# Phase 3: drop the legacy agent_runs.status CHECK on existing DBs. The enum
+# rejected real telemetry values ('abandoned','fallback','unknown') that wired
+# writers produce, silently dropping rows. Idempotent helper — preserves all
+# columns, data, the session_id FK, and every index; no-op when no CHECK exists.
+_DROP_CHECK_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cast-db-drop-status-check.py"
+if [ -f "$_DROP_CHECK_HELPER" ] && command -v python3 >/dev/null 2>&1; then
+  CAST_DB_PATH="$DB_PATH" python3 "$_DROP_CHECK_HELPER" "$DB_PATH" >&2 || true
+fi
+
+if [ "$_columns_added" -eq 1 ]; then
+  echo "[cast-db-init] self-healed: added missing agent_id and/or response columns to agent_runs" >&2
+fi
+
+echo "cast.db initialized (v8, WAL mode, swarm tables included)" >&2
